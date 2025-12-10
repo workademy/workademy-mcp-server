@@ -390,6 +390,61 @@ Parameters:
 - userId: Filter by user (optional)
 ```
 
+### Survey & Assessment Tools
+
+#### `get_pre_course_survey_report`
+Get pre-course survey report with comprehensive analysis of all question answers.
+
+**How it works:**
+1. Initiates report generation (async operation)
+2. Polls operation status until completion (max 2 minutes)
+3. Downloads the CSV file automatically
+4. Analyzes data and provides statistics
+
+```
+Parameters:
+- courseId: Course ID (required)
+
+Returns:
+- operation: Operation details (status, URLs, metadata)
+- csvUrl: Direct link to download CSV file
+- csvData: Raw CSV content
+- analysis: Statistical analysis including:
+  - Total responses
+  - Questions (column headers)
+  - Response frequencies for each question
+  - Top 10 answers with percentages
+  - Summary statistics
+```
+
+**Example response structure:**
+```json
+{
+  "operation": {
+    "id": 3177,
+    "status": "FINISHED",
+    "courseName": "Course Name",
+    "url": "https://...csv"
+  },
+  "analysis": {
+    "totalResponses": 150,
+    "totalColumns": 5,
+    "headers": ["Question 1", "Question 2", ...],
+    "columnAnalysis": {
+      "Question 1": {
+        "totalResponses": 150,
+        "uniqueValues": 12,
+        "frequency": {...},
+        "topResponses": [
+          {"value": "Answer A", "count": 75, "percentage": "50%"},
+          ...
+        ]
+      }
+    }
+  }
+}
+```
+
 ## Usage Examples
 
 ### Example 1: List All Courses
@@ -422,6 +477,21 @@ Create a learning path called "Full Stack Developer" of type LEARNING_PATH with 
 Generate a detailed user course report for course ID 789
 ```
 
+### Example 7: Get Pre-Course Survey Report
+```
+Get the pre-course survey report for course ID 4221 with analysis
+
+This will:
+- Generate the report
+- Wait for it to complete
+- Download the CSV
+- Provide statistical analysis showing:
+  - How many people responded
+  - Top answers for each question
+  - Response percentages
+  - Frequency distributions
+```
+
 ## Authentication
 
 The server uses a simple API key authentication flow:
@@ -450,6 +520,21 @@ The server provides detailed error messages including:
 - API error messages
 - Validation errors
 - Authentication failures
+
+## Data Visualization
+
+The survey report tool provides analyzed data that can be easily visualized:
+
+**Using Claude's Artifacts:**
+Ask Claude to create charts from the survey data:
+- "Create a bar chart showing the top responses for Question 1"
+- "Make a pie chart of the response distribution"
+- "Build a dashboard with all survey statistics"
+
+**Export Options:**
+- CSV data is available for import into Google Sheets, Excel, or Tableau
+- Analysis includes pre-calculated percentages and frequencies
+- Direct CSV download URL provided for external tools
 
 ## API Coverage
 

@@ -7,7 +7,12 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance, AxiosError } from "axios";
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import Papa from 'papaparse';
+import os from 'os';
 
+const claudeTmpDir = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'tmp');
 // Types
 interface WorkademyConfig {
   baseUrl: string;
@@ -441,6 +446,265 @@ class WorkademyClient {
     );
     return response.data;
   }
+// Add this import at the top of your file
+
+// NEW METHOD: Analyze saved CSV file and return statistics
+  async analyzePreCourseSurvey(courseId: number): Promise<any> {
+    console.error(`[MCP] Starting CSV analysis for course ${courseId}`);
+
+    try {
+      // Find the most recent CSV file for this course in claudeTmpDir
+      const files = await fs.readdir(claudeTmpDir);
+      const surveyFiles = files
+        .filter(f => f.startsWith(`pre_course_survey_${courseId}_`))
+        .sort()
+        .reverse();
+
+      if (surveyFiles.length === 0) {
+        throw new Error(`No survey CSV found for course ${courseId}. Please run getPreCourseSurveyReport first.`);
+      }
+
+      const csvPath = path.join(claudeTmpDir, surveyFiles[0]);
+      console.error(`[MCP] Reading CSV from: ${csvPath}`);
+
+      const csvContent = await fs.readFile(csvPath, 'utf8');
+
+      // Parse CSV
+      const parsed = Papa.parse(csvContent, {
+        header: true,
+        skipEmptyLines: true
+      });
+
+      console.error(`[MCP] Parsed ${parsed.data.length} rows`);
+
+      // Group responses by question
+      const questionStats: any = {};
+
+      parsed.data.forEach((row: any) => {
+        const question = row.Question;
+        const userAnswer = row['User Answer'];
+        const options = row.Options;
+
+        if (!question) return;
+
+        if (!questionStats[question]) {
+          questionStats[question] = {
+            questionText: question,
+            options: options || null,
+            responses: {},
+            totalResponses: 0,
+            uniqueUsers: new Set()
+          };
+        }
+
+        questionStats[question].totalResponses++;
+        questionStats[question].uniqueUsers.add(row['User ID']);
+
+        // Count responses
+        if (userAnswer) {
+          if (!questionStats[question].responses[userAnswer]) {
+            questionStats[question].responses[userAnswer] = 0;
+          }
+          questionStats[question].responses[userAnswer]++;
+        }
+      });
+
+      // Calculate percentages and format results
+      const results: any = {};
+
+      Object.keys(questionStats).forEach(question => {
+        const stats = questionStats[question];
+        const total = stats.totalResponses;
+
+        // Sort responses by count
+        const sortedResponses = Object.entries(stats.responses)
+          .map(([answer, count]: [string, any]) => ({
+            answer,
+            count,
+            percentage: ((count / total) * 100).toFixed(2)
+          }))
+          .sort((a, b) => b.count - a.count);
+
+        results[question] = {
+          questionText: question,
+          options: stats.options,
+          totalResponses: total,
+          uniqueUsers: stats.uniqueUsers.size,
+          topAnswers: sortedResponses.slice(0, 20), // Top 20 answers
+          allResponses: sortedResponses.length
+        };
+      });
+
+      console.error(`[MCP] Analysis complete for ${Object.keys(results).length} questions`);
+
+      return {
+        courseId,
+        analyzedAt: new Date().toISOString(),
+        totalRows: parsed.data.length,
+        questionsAnalyzed: Object.keys(results).length,
+        questions: results,
+        csvFilePath: csvPath
+      };
+
+    } catch (error: any) {
+      console.error(`[MCP] Error in analyzePreCourseSurvey:`, error.message);
+      throw error;
+    }
+  }
+  // Pre-Course Survey Report
+  async getPreCourseSurveyReport(courseId: number): Promise<any> {
+    await this.ensureAuthenticated();
+
+    console.error(`[MCP] Starting report generation for course ${courseId}`);
+
+    try {
+      // Step 1: Initiate the report generation with CSV output type
+      const initResponse = await this.axiosInstance.post(
+        `/api/v1/secured/courses/${courseId}/question-answers/_report?q=questionAnswer.courseId=isnot=null`,
+        { outputType: 'CSV' }
+      );
+
+      console.error(`[MCP] Report initiated, operation ID: ${initResponse.data.id}`);
+      console.error(`[MCP] Initial status: ${initResponse.data.status}`);
+
+      const operationId = initResponse.data.id;
+      let operation = initResponse.data;
+      let attempts = 0;
+      const maxAttempts = 240;
+      const pollInterval = 3000;
+
+      // Step 2: Poll the operation until it's finished
+      while (operation.status !== "FINISHED" && attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+
+        const pollResponse = await this.axiosInstance.get(
+          `/api/v1/secured/operations/${operationId}`
+        );
+        operation = pollResponse.data;
+        attempts++;
+
+        console.error(`[MCP] Poll attempt ${attempts}: status=${operation.status}`);
+
+        if (operation.status === "FAILED") {
+          console.error(`[MCP] Report generation failed: ${operation.description}`);
+          throw new Error(`Report generation failed: ${operation.description || 'Unknown error'}`);
+        }
+      }
+
+      if (operation.status !== "FINISHED") {
+        console.error(`[MCP] Report timed out after ${attempts} attempts`);
+        throw new Error(`Report generation timed out after ${maxAttempts * pollInterval / 1000} seconds`);
+      }
+
+      console.error(`[MCP] Report finished, downloading from: ${operation.url}`);
+
+      // Step 3: Download the CSV file
+      const csvResponse = await axios.get(operation.url, {
+        responseType: 'text',
+      });
+
+      console.error(`[MCP] CSV downloaded, size: ${csvResponse.data.length} bytes`);
+
+      // Step 4: Save CSV to claudeTmpDir
+      const timestamp = Date.now();
+
+      const filePath = path.join(claudeTmpDir, `pre_course_survey_${courseId}_${timestamp}.csv`);
+
+      await fs.writeFile(filePath, csvResponse.data, 'utf8');
+      console.error(`[MCP] CSV saved to: ${filePath}`);
+
+      // Step 5: Lightweight analysis
+      const csvData = csvResponse.data;
+      const lightweightAnalysis = this.analyzeCsvLightweight(csvData);
+
+      console.error(`[MCP] Analysis complete`);
+
+      return {
+        courseId: courseId,
+        csvUrl: operation.url,
+        filePath: filePath,
+        csvSizeBytes: csvResponse.data.length,
+        totalResponses: lightweightAnalysis.totalResponses,
+        generatedAt: new Date().toISOString(),
+        analysis: lightweightAnalysis,
+        message: `Full CSV data saved to ${filePath}. Use analyzePreCourseSurvey for detailed statistics.`
+      };
+
+    } catch (error: any) {
+      console.error(`[MCP] Error in getPreCourseSurveyReport:`, error.message);
+      if (error.response) {
+        console.error(`[MCP] Response status: ${error.response.status}`);
+        console.error(`[MCP] Response data:`, JSON.stringify(error.response.data));
+      }
+      throw error;
+    }
+  }
+
+  private analyzeCsvLightweight(csvData: string): any {
+    const lines = csvData.split('\n').filter(line => line.trim());
+    const totalResponses = lines.length - 1;
+
+    return {
+      totalResponses: totalResponses,
+      csvLines: lines.length,
+      header: lines[0],
+      summary: `CSV contains ${totalResponses} responses. Full data available in saved file.`
+    };
+  }
+
+  
+  // Helper method to parse and analyze CSV data
+  private analyzeCSV(csvText: string): any {
+    const lines = csvText.trim().split('\n');
+    if (lines.length === 0) {
+      return { error: 'Empty CSV file' };
+    }
+    
+    // Parse CSV (simple parser, assumes comma-separated)
+    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    const rows = lines.slice(1).map(line => {
+      const values = line.split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+      const row: any = {};
+      headers.forEach((header, index) => {
+        row[header] = values[index] || '';
+      });
+      return row;
+    });
+    
+    // Basic statistics
+    const totalResponses = rows.length;
+    
+    // Analyze each column
+    const columnAnalysis: any = {};
+    headers.forEach(header => {
+      const values = rows.map(row => row[header]).filter(v => v !== '');
+      const uniqueValues = [...new Set(values)];
+      
+      // Count frequency of each value
+      const frequency: any = {};
+      values.forEach(value => {
+        frequency[value] = (frequency[value] || 0) + 1;
+      });
+      
+      columnAnalysis[header] = {
+        totalResponses: values.length,
+        uniqueValues: uniqueValues.length,
+        frequency: frequency,
+        topResponses: Object.entries(frequency)
+          .sort(([, a]: any, [, b]: any) => b - a)
+          .slice(0, 10)
+          .map(([value, count]) => ({ value, count, percentage: ((count as number) / values.length * 100).toFixed(2) + '%' })),
+      };
+    });
+    
+    return {
+      totalResponses,
+      totalColumns: headers.length,
+      headers,
+      columnAnalysis,
+      summary: `Survey has ${totalResponses} responses across ${headers.length} questions`,
+    };
+  }
 }
 
 // MCP Server Setup
@@ -487,6 +751,20 @@ function getClient(): WorkademyClient {
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "analyze_pre_course_survey",
+        description: "Analyze pre-course survey results from saved CSV file. Returns statistics including response frequencies, percentages, and top answers for each question.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            courseId: {
+              type: "number",
+              description: "The ID of the course"
+            }
+          },
+          required: ["courseId"]
+        }
+      },
       // Course Management Tools
       {
         name: "list_courses",
@@ -1083,6 +1361,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["topic"],
         },
       },
+      // Survey Tools
+      {
+        name: "get_pre_course_survey_report",
+        description: "Get pre-course survey report with all question answers for a specific course. This tool initiates report generation, polls until completion, downloads the CSV, and provides statistical analysis including response frequencies and top answers for each question.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            courseId: {
+              type: "number",
+              description: "The ID of the course",
+            },
+          },
+          required: ["courseId"],
+        },
+      },
     ],
   };
 });
@@ -1508,6 +1801,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
       }
+
+      // Survey Tools
+      case "get_pre_course_survey_report": {
+        const { courseId } = request.params.arguments as any;
+        const result = await client.getPreCourseSurveyReport(courseId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "analyze_pre_course_survey": {
+        const { courseId } = request.params.arguments as any;
+        const result = await client.analyzePreCourseSurvey(courseId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
 
       default:
         throw new McpError(
