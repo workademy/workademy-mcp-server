@@ -93,6 +93,7 @@ export function stripHtml(value) {
         return "";
     return String(value)
         .replace(/<[^>]*>/g, " ")
+        .replace(/<[^>]*$/, " ") // tag cut off at the end (analytics stores shortened names)
         .replace(/&nbsp;/g, " ")
         .replace(/&amp;/g, "&")
         .replace(/&quot;/g, '"')
@@ -118,8 +119,11 @@ export function labelRow(row, extra) {
         if (id === undefined || id === null)
             continue;
         const name = extra?.[mapName]?.[id]?.name;
-        if (name !== undefined)
-            labelled[labelField] = stripHtml(name);
+        if (name !== undefined) {
+            const clean = stripHtml(name);
+            // Analytics names are "title: subtitle"; without a subtitle a trailing colon is left over
+            labelled[labelField] = idField === "courseId" ? clean.replace(/[\s:]+$/, "") : clean;
+        }
     }
     return labelled;
 }

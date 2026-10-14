@@ -61,6 +61,12 @@ const num = (value) => {
     const n = typeof value === "number" ? value : Number(value);
     return Number.isFinite(n) ? n : 0;
 };
+/** Certificate scores come as fractions (0.9) in production; show them as percentages. */
+const scorePercent = (value) => value === undefined || value === null || !Number.isFinite(Number(value))
+    ? null
+    : Number(value) <= 1
+        ? Math.round(Number(value) * 1000) / 10
+        : Math.round(Number(value) * 10) / 10;
 const round1 = (value) => value === undefined || value === null || !Number.isFinite(Number(value))
     ? null
     : Math.round(Number(value) * 10) / 10;
@@ -742,7 +748,7 @@ async function monthlyReport(ctx, args) {
                     finished: num(p.amountEnded),
                     abandoned: num(p.amountAbandoned),
                     certificatesIssued: num(c.amountIssued),
-                    avgCertificateScore: round1(c.avgScore),
+                    avgCertificateScorePercent: scorePercent(c.avgScore),
                 },
             };
         });
@@ -876,7 +882,8 @@ async function monthlyReport(ctx, args) {
             warnings,
         });
         return {
-            shown: result.shown.map(({ groupId, truncated, ...rest }) => rest),
+            // groupId stays: different groups can share a name
+            shown: result.shown.map(({ hidden, truncated, ...rest }) => rest),
             hiddenGroups: result.hiddenGroups,
             notIncluded: result.notIncluded,
         };

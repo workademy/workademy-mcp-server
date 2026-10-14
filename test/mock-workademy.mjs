@@ -90,7 +90,8 @@ export async function startMock({
     const start = Number(query.get("start") ?? 0);
     const toDate = start < now - 100 * DAY;
     const ws = `/analytics-api/v1/secured/workspaces/${workspaceId}`;
-    const courseExtra = { courses: { 101: { name: "<p>Data protection refresher</p>" }, 102: { name: "Safety instruction" } } };
+    // like production: "title: subtitle", shortened, sometimes with a cut-off tag
+    const courseExtra = { courses: { 101: { name: "<p>Data protection refresher</p>:" }, 102: { name: 'Safety instruction: <span style="font-style' } } };
     switch (path) {
       case `${ws}/courses/facts/usercourse`:
         return {
@@ -118,7 +119,7 @@ export async function startMock({
       case `${ws}/facts/certificate`:
         return { content: [{ courseId: null, amountIssued: 9, avgScore: 88.46 }], totalElements: 1 };
       case `${ws}/courses/facts/certificate`:
-        return { content: [{ courseId: 101, amountIssued: 9, avgScore: 88.46, minScore: 70, maxScore: 100 }], extra: courseExtra };
+        return { content: [{ courseId: 101, amountIssued: 9, avgScore: 0.8846, minScore: 0.7, maxScore: 1 }], extra: courseExtra };
       case `${ws}/courses/101/modules/facts/questionanswer`:
         return {
           content: [
