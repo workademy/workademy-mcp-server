@@ -1097,15 +1097,73 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
     }
     coursesWithActivity = courses.filter((c) => num(c.toDate.enrolled) > 0).length;
   }
+  // "To date" from the enrolment records when the workspace is small enough: the analytics
+  // history is incomplete for older courses (SE Ranking's SEO Basics: 4,611 records, 1,465 in
+  // analytics). Two counts per course, so only up to 100 courses; larger ones keep analytics.
+  let recordsToDate: { enrolled: number; finished: number } | null = null;
+  if (sources.enrollments === "analytics API" && num(courseCount) > 0 && num(courseCount) <= 100 && timeLeft()) {
+    const list = await safe("courses", warnings, () => fetchAllPages<any>(client, "/api/v1/secured/courses"));
+    const counted = list
+      ? await mapLimit(list.items, 6, (course) =>
+          safe(`course ${course.id} totals`, warnings, async () => ({
+            id: course.id as number,
+            name: stripHtml(course.name),
+            enrolled: await countOf(client, `/api/v1/secured/courses/${course.id}/usercourses`),
+            finished: await countOf(client, `/api/v1/secured/courses/${course.id}/usercourses`, {
+              q: "finishTime=isnot=null",
+            }),
+          }))
+        )
+      : [];
+    if (list && counted.every((c) => c !== null)) {
+      const byId = new Map(counted.map((c) => [c!.id, c!]));
+      for (const row of courses) {
+        const rec = byId.get(row.courseId);
+        if (!rec) continue;
+        row.course = rec.name || row.course;
+        row.toDate = {
+          enrolled: rec.enrolled,
+          finished: rec.finished,
+          completionRate: rate(rec.finished, rec.enrolled),
+          avgDaysToFinish: row.toDate.avgDaysToFinish ?? null,
+        };
+        byId.delete(row.courseId);
+      }
+      // courses with records but no analytics activity
+      for (const rec of byId.values()) {
+        if (rec.enrolled === 0) continue;
+        courses.push({
+          courseId: rec.id,
+          course: rec.name,
+          toDate: { enrolled: rec.enrolled, finished: rec.finished, completionRate: rate(rec.finished, rec.enrolled) },
+          thisMonth: { enrolled: 0, finished: 0 },
+        });
+      }
+      recordsToDate = {
+        enrolled: counted.reduce((t, c) => t + c!.enrolled, 0),
+        finished: counted.reduce((t, c) => t + c!.finished, 0),
+      };
+      sources.toDate = "enrolment records (analytics history is incomplete for older courses)";
+    }
+  }
   courses = courses.filter((c) => num(c.toDate.enrolled) > 0).sort((a, b) => num(b.toDate.enrolled) - num(a.toDate.enrolled));
 
   const sum = (pick: (c: CourseRow) => unknown) => courses.reduce((total, c) => total + num(pick(c)), 0);
   // Prefer the workspace-total rows: per-course rows are capped at the 100 biggest courses
   const totalToDate = totalsToDate?.rows?.[0];
   const totalPeriod = totalsPeriod?.rows?.[0];
-  const enrolledToDate = totalToDate ? num(totalToDate.amountStarted) : sum((c) => c.toDate.enrolled);
-  const finishedToDate = totalToDate ? num(totalToDate.amountEnded) : sum((c) => c.toDate.finished);
-  const abandonedToDate = totalToDate ? num(totalToDate.amountAbandoned) : sum((c) => c.toDate.abandoned);
+  const enrolledToDate = recordsToDate
+    ? recordsToDate.enrolled
+    : totalToDate
+      ? num(totalToDate.amountStarted)
+      : sum((c) => c.toDate.enrolled);
+  const finishedToDate = recordsToDate
+    ? recordsToDate.finished
+    : totalToDate
+      ? num(totalToDate.amountEnded)
+      : sum((c) => c.toDate.finished);
+  // records have no cheap abandoned count, so "open" then means "not finished"
+  const abandonedToDate = recordsToDate ? 0 : totalToDate ? num(totalToDate.amountAbandoned) : sum((c) => c.toDate.abandoned);
   const enrolledThisMonth = totalPeriod ? num(totalPeriod.amountStarted) : sum((c) => c.thisMonth.enrolled);
   const finishedThisMonth = totalPeriod ? num(totalPeriod.amountEnded) : sum((c) => c.thisMonth.finished);
 

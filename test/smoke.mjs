@@ -214,7 +214,9 @@ await check("monthly report (analytics): aggregates, hotspots, small groups hidd
   assert.equal(r.headline.completionRateToDate, 73.5);
   assert.equal(r.headline.newEnrollmentsThisMonth, 32);
   assert.equal(r.headline.completionsThisMonth, 14);
-  assert.equal(r.headline.openToDate, 43);
+  assert.equal(r.headline.openToDate, 45, "to date from records: enrolled minus finished");
+  assert.match(r.sources.toDate, /enrolment records/);
+  assert.ok(a.state.log.some((x) => x.path === "/api/v1/secured/courses/101/usercourses" && x.query.includes("finishTime%3Disnot%3Dnull")));
   assert.equal(r.headline.certificatesThisMonth, 9);
   assert.equal(r.headline.logins, 230);
   assert.equal(r.headline.activeUsers, 37);
@@ -223,7 +225,7 @@ await check("monthly report (analytics): aggregates, hotspots, small groups hidd
   assert.equal(r.courses[0].thisMonth.avgCertificateScorePercent, 88.5, "fraction shown as percent");
   assert.equal(r.departments.shown[0].groupId, 1, "groupId kept to tell same-named groups apart");
   assert.ok(!("hidden" in r.departments.shown[0]));
-  assert.equal(r.courses[0].toDate.open, 28);
+  assert.deepEqual([r.courses[0].toDate.enrolled, r.courses[0].toDate.finished, r.courses[0].toDate.completionRate], [150, 120, 80]);
   assert.deepEqual([r.headline.courses, r.headline.coursesWithActivity], [3, 2]);
   assert.ok(!("started" in r.courses[0].toDate), "always-zero metric left out");
   assert.equal(r.struggleHotspots.questions.length, 1, "question with fewer than 5 answers left out");

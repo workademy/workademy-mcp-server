@@ -166,8 +166,10 @@ export async function startMock({
     if (method === "GET" && path === "/api/v1/secured/users/me")
       return { id: 1, username: `WORKSPACE_ID_${workspaceId}@system.example`, roles: [{ name: "ROLE_ADMIN" }] };
     if (method === "GET" && path === "/api/v1/secured/courses") return page(courses, query);
-    if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/courses\/(\d+)\/usercourses$/)))
-      return page(byCourse[m[1]] ?? [], query);
+    if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/courses\/(\d+)\/usercourses$/))) {
+      const rows = byCourse[m[1]] ?? [];
+      return page(query.get("q") === "finishTime=isnot=null" ? rows.filter((u) => u.finishTime) : rows, query);
+    }
     if (method === "DELETE" && (m = path.match(/^\/api\/v1\/secured\/courses\/(\d+)$/))) return null;
     if (method === "GET" && path === "/api/v1/secured/users")
       return page(Array.from({ length: 120 }, (_, i) => ({ id: i })), query);
