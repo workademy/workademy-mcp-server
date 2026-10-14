@@ -230,6 +230,14 @@ export async function startMock({
         state.always401.add(url.searchParams.get("path"));
         return send(200, { ok: true });
       }
+      if (path === `/workspace-assets/${new URL(base).host.replace(/\./g, "_")}/profile.json`) {
+        return send(200, {
+          company: name,
+          logo: "https://cdn.example/white-logo.png",
+          logoHeader: "/img/logo_header.png",
+          theme: { themes: { light: { primary: "#006fb9", secondary: "#e95542" } } },
+        });
+      }
       if (path === "/oauth/token" && req.method === "POST") {
         state.tokenRequests += 1;
         const form = new URLSearchParams(body);

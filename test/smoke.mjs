@@ -29,6 +29,7 @@ const baseEnv = {
   WORKADEMY_OAUTH_CLIENT_SECRET: "test-secret",
   WORKADEMY_POLL_INTERVAL_MS: "20",
   WORKADEMY_TODO_TIMEOUT_MS: "500",
+  WORKADEMY_ASSET_CDN: "", // set per run below
   WORKADEMY_EXPORT_DIR: tmp,
 };
 
@@ -94,7 +95,7 @@ const now = new Date();
 const thisMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 
 console.log("multi-workspace mode");
-const mcp = await connect({ WORKADEMY_WORKSPACES_FILE: workspacesFile, KEY_EDERA: "key-a" });
+const mcp = await connect({ WORKADEMY_WORKSPACES_FILE: workspacesFile, KEY_EDERA: "key-a", WORKADEMY_ASSET_CDN: a.url });
 
 await check("every tool except list_configured_workspaces takes `workspace`", async () => {
   const { tools } = await mcp.listTools();
@@ -292,6 +293,14 @@ await check("export_report waits, downloads and saves the CSV", async () => {
   assert.ok(!JSON.stringify(sum).includes(LEARNER_NAMES[0]));
   await assert.rejects(() => call(mcp, "summarize_export", { filePath: sept.filePath, groupBy: ["Email"] }), /identifies people/);
   await assert.rejects(() => call(mcp, "summarize_export", { filePath: "/etc/passwd" }), /must be a CSV from export_report/);
+});
+
+await check("get_workspace_branding reads the workspace's profile.json", async () => {
+  const b = await call(mcp, "get_workspace_branding");
+  assert.equal(b.found, true);
+  assert.equal(b.company, "EdEra (mock)");
+  assert.equal(b.colors.primary, "#006fb9");
+  assert.equal(b.logos.header, `http://${new URL(a.url).host}/img/logo_header.png`.replace("http://", "https://"), "relative logo made absolute");
 });
 
 await check("get_admin_todos", async () => {

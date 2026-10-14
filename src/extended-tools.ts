@@ -931,6 +931,55 @@ async function summarizeExport(_ctx: ToolContext, args: Record<string, any>) {
   return { file: path.basename(filePath), totalRows: parsed.data.length, groupBy, rows };
 }
 
+/**
+ * The workspace's branding as the web app loads it: profile.json on the asset CDN
+ * (logos, theme colours, company name). Public files, no API key needed.
+ */
+async function workspaceBranding(ctx: ToolContext) {
+  const { client } = ctx;
+  const cdn = (process.env.WORKADEMY_ASSET_CDN || "https://d18lcb7860whbu.cloudfront.net").replace(/\/+$/, "");
+  const workspaceId = await client.getWorkspaceId();
+  const info = await client.request<any>("GET", `/api/v1/secured/workspaces/${workspaceId}`).catch(() => null);
+  const host = String(info?.hostname || new URL(client.baseUrl).host).toLowerCase();
+  const candidates = [
+    ...(info?.uuid ? [`${cdn}/workspaces/${info.uuid}/assets/profile.json`] : []),
+    `${cdn}/workspace-assets/${host.replace(/\./g, "_")}/profile.json`,
+  ];
+  let profile: any = null;
+  let profileUrl: string | null = null;
+  for (const url of candidates) {
+    try {
+      profile = (await axios.get(url, { timeout: 10_000 })).data;
+      profileUrl = url;
+      break;
+    } catch {
+      // try the next location
+    }
+  }
+  if (!profile) {
+    return { workspace: ctx.workspace.alias, found: false, tried: candidates };
+  }
+  const absolute = (value: unknown) =>
+    typeof value === "string" && value ? new URL(value, `https://${host}/`).toString() : null;
+  const light = profile.theme?.themes?.light ?? {};
+  return {
+    workspace: ctx.workspace.alias,
+    found: true,
+    profileUrl,
+    company: profile.company ?? info?.name ?? null,
+    title: profile.title ?? null,
+    companyUrl: profile.companyUrl ?? null,
+    logos: {
+      logo: absolute(profile.logo),
+      header: absolute(profile.logoHeader),
+      footer: absolute(profile.logoFooter),
+      favicon: absolute(profile.favicon),
+    },
+    colors: { primary: light.primary ?? null, secondary: light.secondary ?? null, accent: light.accent ?? null },
+    note: "Logo variants can be white (for dark backgrounds); check before placing one on a light page.",
+  };
+}
+
 async function adminTodos(ctx: ToolContext, args: Record<string, any>) {
   const warnings: string[] = [];
   const daysAhead = clampInt(args.daysAhead, 31, 1, 366);
@@ -1434,6 +1483,12 @@ export const EXTENDED_TOOLS = [
     },
   },
   {
+    name: "get_workspace_branding",
+    description:
+      "Branding of a workspace as its learners see it: company name, logo variants (logo, header, footer, favicon), theme colours and company URL, from the workspace's profile.json. Use it to brand client reports.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "get_admin_todos",
     description:
       "Counts the admin should act on: pending enrollment approvals, ungraded open answers, and scheduled course/learning-path runs coming up.",
@@ -1467,6 +1522,7 @@ const HANDLERS: Record<string, (ctx: ToolContext, args: Record<string, any>) => 
   get_group_course_stats: groupCourseStats,
   export_report: exportReport,
   summarize_export: summarizeExport,
+  get_workspace_branding: (ctx) => workspaceBranding(ctx),
   get_admin_todos: adminTodos,
   get_monthly_report: monthlyReport,
 };
