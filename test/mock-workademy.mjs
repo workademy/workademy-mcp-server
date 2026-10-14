@@ -248,7 +248,16 @@ export async function startMock({
         return send(200, { access_token: token, token_type: "bearer", expires_in: 3600 });
       }
       if (path === "/files/77.csv") {
-        return send(200, `User,Email,Course,Status\n${LEARNER_NAMES[0]},a@x,Data protection refresher,FINISHED\n${LEARNER_NAMES[1]},b@x,Data protection refresher,IN_PROGRESS\n`, "text/csv");
+        // production column layout; dates are UTC "dd.MM.yyyy HH:mm:ss"; this mock ignores q
+        const csv = [
+          "Course Name,Name,Email,Started On,Finished On,Quiz Progress,Status,Enrollment ID",
+          `Data protection refresher,${LEARNER_NAMES[0]},a@x,10.08.2026 10:00:00,12.08.2026 10:00:00,90,OK,1`,
+          `Data protection refresher,${LEARNER_NAMES[1]},b@x,02.09.2026 10:00:00,05.09.2026 09:00:00,80,OK,2`,
+          `Safety instruction,${LEARNER_NAMES[2]},c@x,03.09.2026 10:00:00,,10,OK,3`,
+          `Safety instruction,${LEARNER_NAMES[3]},d@x,20.09.2026 10:00:00,01.10.2026 08:00:00,100,OK,4`,
+          `Data protection refresher,${LEARNER_NAMES[4]},e@x,02.10.2026 10:00:00,03.10.2026 10:00:00,70,OK,5`,
+        ].join("\n");
+        return send(200, csv + "\n", "text/csv");
       }
 
       const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";

@@ -96,8 +96,42 @@ function toEpochMs(value, name, endOfDay = false) {
     }
     return dateOnly && endOfDay ? ms + DAY_MS - 1 : ms;
 }
-/** Calendar month in UTC. No month = the previous full month. */
-function monthRange(month) {
+/** Offset of `timeZone` from UTC at instant `ms`, in milliseconds. */
+function zoneOffsetMs(ms, timeZone) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        hourCycle: "h23",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+    }).formatToParts(new Date(ms));
+    const get = (type) => Number(parts.find((p) => p.type === type)?.value);
+    return Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second")) - ms;
+}
+/** UTC instant of local midnight on the given day in `timeZone`. */
+function zonedMidnight(year, monthIndex, day, timeZone) {
+    if (timeZone === "UTC")
+        return Date.UTC(year, monthIndex, day);
+    const guess = Date.UTC(year, monthIndex, day);
+    let ms = guess - zoneOffsetMs(guess, timeZone);
+    ms = guess - zoneOffsetMs(ms, timeZone); // second pass for DST changes
+    return ms;
+}
+function checkTimeZone(timeZone) {
+    const zone = typeof timeZone === "string" && timeZone.trim() ? timeZone.trim() : "UTC";
+    try {
+        new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    }
+    catch {
+        throw new McpError(ErrorCode.InvalidParams, `Unknown timezone "${zone}" (use an IANA name like Europe/Berlin)`);
+    }
+    return zone;
+}
+/** Calendar month (default UTC). No month = the previous full month. */
+function monthRange(month, timeZone = "UTC") {
     let year;
     let monthIndex;
     if (month) {
@@ -119,8 +153,8 @@ function monthRange(month) {
     }
     return {
         label: `${year}-${String(monthIndex + 1).padStart(2, "0")}`,
-        start: Date.UTC(year, monthIndex, 1),
-        end: Date.UTC(year, monthIndex + 1, 1) - 1,
+        start: zonedMidnight(year, monthIndex, 1, timeZone),
+        end: zonedMidnight(year, monthIndex + 1, 1, timeZone) - 1,
     };
 }
 function statusOf(error) {
@@ -625,16 +659,93 @@ async function exportReport(ctx, args) {
     }
     const { client } = ctx;
     const workspaceId = await client.getWorkspaceId();
+    // Period filter, same RSQL as the admin "Download full report" dialog
+    const timeZone = checkTimeZone(args.timezone);
+    let start;
+    let end;
+    if (args.month) {
+        ({ start, end } = monthRange(args.month, timeZone));
+    }
+    else {
+        start = toEpochMs(args.start, "start");
+        end = toEpochMs(args.end, "end", true);
+    }
+    // The API currently treats "before" (=lt= / =le=) like "after" on enrollment dates (found Oct 2026),
+    // so by default only the "after" part goes to the server and the end date is applied here.
+    // Set WORKADEMY_RSQL_BEFORE_FIXED=true once the backend is fixed.
+    const serverEnd = process.env.WORKADEMY_RSQL_BEFORE_FIXED === "true";
+    const conditions = [];
+    const mode = args.periodFilter ?? "started_and_finished";
+    let localEnd = null;
+    if (start !== undefined || end !== undefined) {
+        if (mode === "started_and_finished") {
+            // "enrolments started from <start> and finished by <end>" (the dialog's wording)
+            if (start !== undefined)
+                conditions.push(`createTime=gt=${start}`);
+            if (end !== undefined) {
+                if (serverEnd)
+                    conditions.push(`finishTime=lt=${end}`);
+                else
+                    localEnd = { column: "Finished On", end };
+            }
+        }
+        else if (mode === "enrolled") {
+            if (start !== undefined)
+                conditions.push(`createTime=ge=${start}`);
+            if (end !== undefined) {
+                if (serverEnd)
+                    conditions.push(`createTime=le=${end}`);
+                else
+                    localEnd = { column: "Started On", end };
+            }
+        }
+        else if (mode === "finished") {
+            if (start !== undefined)
+                conditions.push(`finishTime=ge=${start}`);
+            if (end !== undefined) {
+                if (serverEnd)
+                    conditions.push(`finishTime=le=${end}`);
+                else
+                    localEnd = { column: "Finished On", end };
+            }
+        }
+        else {
+            throw new McpError(ErrorCode.InvalidParams, "periodFilter must be started_and_finished, enrolled or finished");
+        }
+    }
+    if (args.q)
+        conditions.push(String(args.q));
+    const params = {};
+    if (args.type)
+        params.type = args.type;
+    if (conditions.length)
+        params.q = conditions.join(";");
     const operation = await client.request("POST", scope.path(args, workspaceId), {
-        params: args.type ? { type: args.type } : undefined,
+        params: Object.keys(params).length ? params : undefined,
         data: { outputType: "CSV" },
     });
     const finished = await waitForOperation(client, operation.id);
     if (!finished.url) {
         return { workspace: ctx.workspace.alias, operation: finished, note: "Export finished but returned no download URL." };
     }
-    const csv = await client.download(finished.url);
-    const dir = process.env.WORKADEMY_EXPORT_DIR || path.join(os.tmpdir(), "workademy-mcp-exports");
+    let csv = await client.download(finished.url);
+    const notes = [];
+    if (localEnd) {
+        const all = Papa.parse(csv, { header: true, skipEmptyLines: true });
+        if ((all.meta.fields ?? []).includes(localEnd.column)) {
+            const kept = all.data.filter((row) => {
+                const ms = parseExportDate(row[localEnd.column]);
+                return ms !== null && ms <= localEnd.end;
+            });
+            csv = Papa.unparse(kept, { columns: all.meta.fields });
+            notes.push(`End date applied on this side ("${localEnd.column}" <= ${iso(localEnd.end)}): ${all.data.length - kept.length} of ${all.data.length} rows removed. ` +
+                "The API's \"before\" filter on enrollment dates returns \"after\" instead.");
+        }
+        else {
+            notes.push(`This export has no "${localEnd.column}" column, so the end date was NOT applied.`);
+        }
+    }
+    const dir = exportDir();
     await fs.mkdir(dir, { recursive: true });
     const ids = scope.needs.map((key) => args[key]).join("_");
     const filePath = path.join(dir, `${ctx.workspace.alias}_${args.scope}${ids ? "_" + ids : ""}_${Date.now()}.csv`);
@@ -643,11 +754,78 @@ async function exportReport(ctx, args) {
     return {
         workspace: ctx.workspace.alias,
         scope: args.scope,
+        filter: params.q ?? null,
+        period: start !== undefined || end !== undefined ? { start: iso(start), end: iso(end), timezone: timeZone } : null,
         filePath,
         rows: parsed.data.length,
         columns: parsed.meta.fields ?? [],
-        note: "The file contains named learner data. It stays on this computer; share aggregates, not the file.",
+        notes,
+        note: "The file contains named learner data. It stays on this computer; use summarize_export for counts.",
     };
+}
+function exportDir() {
+    return path.resolve(process.env.WORKADEMY_EXPORT_DIR || path.join(os.tmpdir(), "workademy-mcp-exports"));
+}
+/** Export dates look like "06.10.2026 11:08:16" and are UTC. */
+function parseExportDate(value) {
+    const match = /^(\d{2})\.(\d{2})\.(\d{4})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(value ?? "").trim());
+    if (!match)
+        return null;
+    const [, dd, mm, yyyy, hh, mi, ss] = match;
+    return Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(mi), Number(ss ?? 0));
+}
+// Columns that identify a person; summarize_export never groups by them
+const PERSONAL_COLUMN = /(^|\b)(name|e-?mail|user ?id|user ?name|username|enrollment ?id|certificate|phone|first ?name|last ?name|login)(\b|$)/i;
+const ALLOWED_NAME_COLUMNS = /^(course name|course author|group name|learning path name|module name)$/i;
+async function summarizeExport(_ctx, args) {
+    const dir = exportDir();
+    const filePath = path.resolve(String(args.filePath ?? ""));
+    if (!filePath.startsWith(dir + path.sep) || !filePath.endsWith(".csv")) {
+        throw new McpError(ErrorCode.InvalidParams, `filePath must be a CSV from export_report (in ${dir})`);
+    }
+    const parsed = Papa.parse(await fs.readFile(filePath, "utf8"), {
+        header: true,
+        skipEmptyLines: true,
+    });
+    const fields = parsed.meta.fields ?? [];
+    const groupBy = Array.isArray(args.groupBy) && args.groupBy.length ? args.groupBy : ["Course Name", "Status"];
+    for (const column of groupBy) {
+        if (!fields.includes(column)) {
+            throw new McpError(ErrorCode.InvalidParams, `No column "${column}". Columns: ${fields.join(", ")}`);
+        }
+        if (PERSONAL_COLUMN.test(column) && !ALLOWED_NAME_COLUMNS.test(column)) {
+            throw new McpError(ErrorCode.InvalidParams, `"${column}" identifies people; summarize_export only groups by non-personal columns`);
+        }
+    }
+    // numeric columns get averages per group (progress, minutes)
+    const numeric = fields.filter((f) => !groupBy.includes(f) && !PERSONAL_COLUMN.test(f) && /progress|minutes|score/i.test(f));
+    const groups = new Map();
+    for (const row of parsed.data) {
+        const key = Object.fromEntries(groupBy.map((c) => [c, stripHtml(row[c] ?? "")]));
+        const id = JSON.stringify(key);
+        if (!groups.has(id))
+            groups.set(id, { key, count: 0, finished: 0, sums: {} });
+        const g = groups.get(id);
+        g.count += 1;
+        if (row["Finished On"])
+            g.finished += 1;
+        for (const f of numeric) {
+            const n = Number(row[f]);
+            if (row[f] !== "" && Number.isFinite(n)) {
+                const [s, c] = g.sums[f] ?? [0, 0];
+                g.sums[f] = [s + n, c + 1];
+            }
+        }
+    }
+    const rows = [...groups.values()]
+        .sort((a, b) => b.count - a.count)
+        .map((g) => ({
+        ...g.key,
+        enrollments: g.count,
+        ...(fields.includes("Finished On") ? { finished: g.finished } : {}),
+        ...Object.fromEntries(Object.entries(g.sums).map(([f, [s, c]]) => [`avg ${f}`, Math.round((s / c) * 10) / 10])),
+    }));
+    return { file: path.basename(filePath), totalRows: parsed.data.length, groupBy, rows };
 }
 async function adminTodos(ctx, args) {
     const warnings = [];
@@ -1026,8 +1204,30 @@ export const EXTENDED_TOOLS = [
                 userId: { type: "number" },
                 learningPathId: { type: "number" },
                 type: { type: "string", enum: ["OVERVIEW", "DETAILED"], description: "Report type where supported" },
+                month: { type: "string", description: "Only this month, YYYY-MM (in `timezone`)" },
+                start: dateParam("Period start (instead of month)"),
+                end: dateParam("Period end, inclusive (instead of month)"),
+                periodFilter: {
+                    type: "string",
+                    enum: ["started_and_finished", "enrolled", "finished"],
+                    description: "started_and_finished (default, same as the admin dialog: enrolled after start and finished before end), enrolled (enrolled in the period), finished (finished in the period)",
+                },
+                timezone: { type: "string", description: "IANA timezone for month boundaries, e.g. Europe/Berlin (the admin UI uses the browser's). Default UTC" },
+                q: { type: "string", description: "Extra RSQL filter, e.g. course.id==658" },
             },
             required: ["scope"],
+        },
+    },
+    {
+        name: "summarize_export",
+        description: "Count a CSV saved by export_report, grouped by non-personal columns (default: Course Name and Status), with finished counts and averages of progress/minutes columns. Refuses to group by names, e-mails or ids.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                filePath: { type: "string", description: "filePath returned by export_report" },
+                groupBy: { type: "array", items: { type: "string" }, description: "Columns to group by" },
+            },
+            required: ["filePath"],
         },
     },
     {
@@ -1060,6 +1260,7 @@ const HANDLERS = {
     get_course_completion: courseCompletion,
     get_group_course_stats: groupCourseStats,
     export_report: exportReport,
+    summarize_export: summarizeExport,
     get_admin_todos: adminTodos,
     get_monthly_report: monthlyReport,
 };

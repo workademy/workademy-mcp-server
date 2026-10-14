@@ -271,11 +271,25 @@ await check("get_course_completion and get_group_course_stats", async () => {
 
 await check("export_report waits, downloads and saves the CSV", async () => {
   const e = await call(mcp, "export_report", { scope: "workspace" });
-  assert.equal(e.rows, 2);
-  assert.deepEqual(e.columns, ["User", "Email", "Course", "Status"]);
+  assert.equal(e.rows, 5);
+  assert.ok(e.columns.includes("Course Name") && e.columns.includes("Finished On"));
   assert.ok(fs.existsSync(e.filePath));
   assert.ok(!JSON.stringify(e).includes(LEARNER_NAMES[0]), "names stay in the file, not the tool output");
   await assert.rejects(() => call(mcp, "export_report", { scope: "course" }), /needs: courseId/);
+
+  // September, finished in the month: only the "after" part goes to the API, the end date is applied here
+  const before = a.state.log.length;
+  const sept = await call(mcp, "export_report", { scope: "workspace", month: "2026-09", periodFilter: "finished" });
+  const sent = a.state.log.slice(before).find((x) => x.method === "POST" && x.path.endsWith("/usercourses/_report"));
+  assert.match(decodeURIComponent(sent.query), /q=finishTime=ge=1788220800000$/, "no =le= sent to the API");
+  assert.equal(sept.rows, 2, "rows finished after 30 Sep (or not finished) removed locally");
+  assert.match(sept.notes[0], /3 of 5 rows removed/);
+
+  const sum = await call(mcp, "summarize_export", { filePath: sept.filePath });
+  assert.deepEqual(sum.rows, [{ "Course Name": "Data protection refresher", Status: "OK", enrollments: 2, finished: 2, "avg Quiz Progress": 85 }]);
+  assert.ok(!JSON.stringify(sum).includes(LEARNER_NAMES[0]));
+  await assert.rejects(() => call(mcp, "summarize_export", { filePath: sept.filePath, groupBy: ["Email"] }), /identifies people/);
+  await assert.rejects(() => call(mcp, "summarize_export", { filePath: "/etc/passwd" }), /must be a CSV from export_report/);
 });
 
 await check("get_admin_todos", async () => {

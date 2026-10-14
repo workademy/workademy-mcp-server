@@ -55,8 +55,13 @@ export declare const EXTENDED_TOOLS: ({
             userId?: undefined;
             learningPathId?: undefined;
             type?: undefined;
-            daysAhead?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -90,8 +95,13 @@ export declare const EXTENDED_TOOLS: ({
             userId?: undefined;
             learningPathId?: undefined;
             type?: undefined;
-            daysAhead?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -167,8 +177,13 @@ export declare const EXTENDED_TOOLS: ({
             userId?: undefined;
             learningPathId?: undefined;
             type?: undefined;
-            daysAhead?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -214,8 +229,13 @@ export declare const EXTENDED_TOOLS: ({
             userId?: undefined;
             learningPathId?: undefined;
             type?: undefined;
-            daysAhead?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -267,8 +287,13 @@ export declare const EXTENDED_TOOLS: ({
             userId?: undefined;
             learningPathId?: undefined;
             type?: undefined;
-            daysAhead?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -303,8 +328,73 @@ export declare const EXTENDED_TOOLS: ({
                 enum: string[];
                 description: string;
             };
+            month: {
+                type: string;
+                description: string;
+            };
+            start: {
+                type: string;
+                description: string;
+            };
+            end: {
+                type: string;
+                description: string;
+            };
+            periodFilter: {
+                type: string;
+                enum: string[];
+                description: string;
+            };
+            timezone: {
+                type: string;
+                description: string;
+            };
+            q: {
+                type: string;
+                description: string;
+            };
             verify?: undefined;
             fact?: undefined;
+            moduleId?: undefined;
+            lectureId?: undefined;
+            breakdown?: undefined;
+            aggregationType?: undefined;
+            timeseries?: undefined;
+            page?: undefined;
+            size?: undefined;
+            sort?: undefined;
+            sortDir?: undefined;
+            maxCourses?: undefined;
+            minGroupSize?: undefined;
+            maxGroups?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
+            topQuestions?: undefined;
+            includeDepartments?: undefined;
+        };
+        required: string[];
+    };
+} | {
+    name: string;
+    description: string;
+    inputSchema: {
+        type: string;
+        properties: {
+            filePath: {
+                type: string;
+                description: string;
+            };
+            groupBy: {
+                type: string;
+                items: {
+                    type: string;
+                };
+                description: string;
+            };
+            verify?: undefined;
+            fact?: undefined;
+            courseId?: undefined;
             moduleId?: undefined;
             lectureId?: undefined;
             breakdown?: undefined;
@@ -317,10 +407,18 @@ export declare const EXTENDED_TOOLS: ({
             sort?: undefined;
             sortDir?: undefined;
             maxCourses?: undefined;
+            groupId?: undefined;
             minGroupSize?: undefined;
             maxGroups?: undefined;
-            daysAhead?: undefined;
+            scope?: undefined;
+            userId?: undefined;
+            learningPathId?: undefined;
+            type?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -359,6 +457,11 @@ export declare const EXTENDED_TOOLS: ({
             learningPathId?: undefined;
             type?: undefined;
             month?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
         };
@@ -407,6 +510,11 @@ export declare const EXTENDED_TOOLS: ({
             userId?: undefined;
             learningPathId?: undefined;
             type?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
             daysAhead?: undefined;
         };
         required?: undefined;
