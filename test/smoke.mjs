@@ -464,6 +464,8 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
       workspaces: {
         edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", report: { client: "EdEra", language: "uk", logo: "assets/workademy-logo.png" } },
         client: { name: "Client", baseUrl: b.url, apiKeyEnv: "KEY_CLIENT", report: { minCompletions: 100000 } },
+        // a key the API refuses: every call fails, which must not look like a quiet month
+        refused: { id: 20, name: "Refused", baseUrl: b.url, apiKeyEnv: "KEY_REFUSED" },
         demo: { name: "Demo", hostname: "demo.example", report: { skip: true } },
         missing: { hostname: "missing.example", apiKeyEnv: "KEY_NOT_SET" },
       },
@@ -473,7 +475,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   let stdout = "";
   try {
     ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", out], {
-      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", KEY_CLIENT: "key-b", WORKADEMY_ASSET_CDN: a.url },
+      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", KEY_CLIENT: "key-b", KEY_REFUSED: "not-a-key", WORKADEMY_ASSET_CDN: a.url },
       encoding: "utf8",
     }));
     assert.fail("a workspace without a key should make the run exit with an error code");
@@ -484,7 +486,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   const summary = JSON.parse(fs.readFileSync(path.join(out, "2026-09", "summary.json"), "utf8"));
   assert.deepEqual(
     summary.rows.map((r) => [r.workspace, r.kind]),
-    [["edera", "report"], ["client", "winback"], ["demo", "skipped"], ["missing", "error"]],
+    [["edera", "report"], ["client", "winback"], ["refused", "error"], ["demo", "skipped"], ["missing", "error"]],
     stdout
   );
   const edera = summary.rows[0].result;
@@ -493,7 +495,9 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   assert.ok(!edera.warnings.some((w) => w.startsWith("No usable client logo")), "logo file from workspaces.json used");
   const md = fs.readFileSync(path.join(out, "2026-09", "summary.md"), "utf8");
   assert.match(md, /## Win-back email instead \(1\)[\s\S]*\*\*Client\*\* \(client\): \d+ completions, below the threshold of 100000/);
-  assert.match(md, /## Failed \(1\)\n\n- missing: no API key/);
+  assert.match(md, /## Failed \(2\)\n\n- refused: Workademy refused access \(401\)[^\n]*--only refused\.\n- missing: no API key/);
+  assert.ok(md.includes("npm run reports -- --month 2026-09 --only refused,missing"), "ready-to-paste rerun command");
+  assert.ok(!fs.existsSync(path.join(out, "2026-09", "refused.report.json")), "no data file for a failed workspace");
   assert.ok(!fs.existsSync(path.join(out, "2026-09", "Client_Workademy_report_2026-09.pdf")), "no PDF for a win-back account");
   for (const alias of ["edera", "client"]) {
     const data = JSON.parse(fs.readFileSync(path.join(out, "2026-09", `${alias}.report.json`), "utf8"));

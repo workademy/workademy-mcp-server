@@ -21,6 +21,25 @@ export async function saveReportData(alias, report) {
     await fs.writeFile(file, JSON.stringify(report, null, 1));
     return file;
 }
+/**
+ * A report whose basic calls all failed is not "a quiet month". Returns what went wrong, or null.
+ * (Found 15 Oct 2026: keys created a few minutes earlier were refused with 403 on every call.)
+ */
+export function reportProblem(report, alias) {
+    const h = report?.headline ?? {};
+    if (h.courses !== null && h.courses !== undefined)
+        return null;
+    if (h.learners !== null && h.learners !== undefined)
+        return null;
+    const warnings = report?.warnings ?? [];
+    const refused = warnings.find((w) => /\b(401|403)\b/.test(w));
+    if (refused) {
+        const status = /\b(401|403)\b/.exec(refused)[1];
+        return (`Workademy refused access (${status}), so there are no numbers. ` +
+            `A key created in the last few minutes may not work yet: run again later with --only ${alias}.`);
+    }
+    return `could not read the workspace: ${warnings[0] ?? "no data came back"}`;
+}
 /** A report is worth sending when people actually finished courses that month. */
 export function sendDecision(report, settings) {
     const min = Number.isFinite(Number(settings?.minCompletions)) ? Number(settings.minCompletions) : DEFAULT_MIN_COMPLETIONS;
@@ -51,6 +70,9 @@ export async function createMonthlyPdf(ctx, args, options = {}) {
             // the device bridge allows 60 s per tool call; leave room for the browser
             budgetMs: options.budgetMs ?? 35_000,
         }));
+    const problem = reportProblem(report, ctx.workspace.alias);
+    if (problem)
+        throw new Error(`${ctx.workspace.alias}: ${problem}`);
     const warnings = [...(report.warnings ?? [])];
     const language = languageFor(settings, report.workspace?.locale);
     const client = settings.client || ctx.workspace.name || report.workspace?.name || ctx.workspace.alias;

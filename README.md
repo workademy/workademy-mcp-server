@@ -217,6 +217,10 @@ was made from (`<workspace>.report.json`, counts only) and `summary.md`:
 who gets the report, who gets the win-back email instead (fewer than 5 completions in the month), and what failed.
 From Claude, `create_monthly_report_pdf` makes one client's PDF.
 
+A workspace that returns no numbers at all (for example a key Workademy still refuses, which can happen for a few
+minutes right after `npm run keys`) is listed under "Failed" with a ready-to-paste command to run it again; it never
+lands on the win-back list.
+
 Settings per workspace go in a `report` block in `workspaces.json` (all optional):
 
 ```json

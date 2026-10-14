@@ -8,7 +8,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { WorkspaceRegistry, oauthClientBasic } from "./registry.js";
 import { monthlyReport } from "./extended-tools.js";
-import { createMonthlyPdf, reportsDir, saveReportData, sendDecision } from "./monthly-pdf.js";
+import { createMonthlyPdf, reportProblem, reportsDir, saveReportData, sendDecision, } from "./monthly-pdf.js";
 import { launchBrowser } from "./report-pdf.js";
 process.env.WORKADEMY_MCP_NO_SERVER = "1";
 const { WorkademyClient } = await import("./index.js");
@@ -96,6 +96,13 @@ async function main() {
                 const ctx = { client, workspace, registry };
                 // no 60 s bridge limit here, so large workspaces get the time they need
                 const report = await monthlyReport(ctx, { month, includeDepartments: false, budgetMs: 150_000 });
+                // no numbers at all (refused key, workspace gone) is a failure, not a quiet month
+                const problem = reportProblem(report, label);
+                if (problem) {
+                    rows.push({ kind: "error", workspace: label, error: problem });
+                    console.log(`\r✗ ${label}: ${problem}`);
+                    continue;
+                }
                 const decision = sendDecision(report, workspace.report);
                 const clientName = workspace.report?.client || workspace.name || report.workspace?.name || label;
                 if (!decision.send && !opts.all) {
@@ -127,8 +134,14 @@ async function main() {
     await fs.writeFile(path.join(dir, "summary.md"), md);
     await fs.writeFile(path.join(dir, "summary.json"), JSON.stringify({ month, createdAt: new Date().toISOString(), rows }, null, 2));
     console.log(`\nSummary: ${path.relative(process.cwd(), path.join(dir, "summary.md"))}`);
-    if (rows.some((r) => r.kind === "error"))
+    const failed = rows.filter((r) => r.kind === "error").map((r) => r.workspace);
+    if (failed.length) {
+        console.log(`Run again for the ${failed.length} that failed: ${rerunCommand(month, failed)}`);
         process.exitCode = 1;
+    }
+}
+function rerunCommand(month, workspaces) {
+    return `npm run reports -- --month ${month} --only ${workspaces.join(",")}`;
 }
 function summaryMarkdown(month, rows) {
     const cell = (v) => String(v ?? "–").replace(/\|/g, "\\|");
@@ -154,6 +167,7 @@ function summaryMarkdown(month, rows) {
         lines.push("", `## Failed (${errors.length})`, "");
         for (const r of errors)
             lines.push(`- ${r.workspace}: ${r.error}`);
+        lines.push("", "Run again for these:", "", "```", rerunCommand(month, errors.map((r) => r.workspace)), "```");
     }
     const skipped = rows.filter((r) => r.kind === "skipped");
     if (skipped.length)
