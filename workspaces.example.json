@@ -1,0 +1,18 @@
+{
+  "default": "edera",
+  "workspaces": {
+    "edera": {
+      "id": 10,
+      "name": "EdEra",
+      "hostname": "study.ed-era.com",
+      "apiKeyEnv": "WORKADEMY_KEY_EDERA",
+      "readOnly": false
+    },
+    "client-a": {
+      "id": 123,
+      "name": "Client A",
+      "hostname": "client-a.theworkademy.com",
+      "apiKeyEnv": "WORKADEMY_KEY_CLIENT_A"
+    }
+  }
+}

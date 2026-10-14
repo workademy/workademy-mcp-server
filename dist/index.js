@@ -6,12 +6,15 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import Papa from 'papaparse';
 import os from 'os';
+import { WorkspaceRegistry, oauthClientBasic } from "./registry.js";
+import { EXTENDED_TOOLS, assertToolAllowed, decorateTools, handleExtendedTool, listConfiguredWorkspaces, } from "./extended-tools.js";
 const claudeTmpDir = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'tmp');
-// Workademy API Client
-class WorkademyClient {
+// Workademy API Client (one instance per workspace)
+export class WorkademyClient {
     axiosInstance;
     config;
     tokenExpiresAt;
+    authPromise;
     constructor(config) {
         this.config = config;
         this.axiosInstance = axios.create({
@@ -20,39 +23,52 @@ class WorkademyClient {
                 "Content-Type": "application/json",
             },
         });
-        // Add response interceptor for error handling
+        // Always send the current token, also on retried requests
+        this.axiosInstance.interceptors.request.use((request) => {
+            if (this.config.accessToken) {
+                request.headers.set("Authorization", `Bearer ${this.config.accessToken}`);
+            }
+            return request;
+        });
+        // On 401: get a fresh token and retry once. A second 401 goes back to the caller.
         this.axiosInstance.interceptors.response.use((response) => response, async (error) => {
-            if (error.response?.status === 401 && this.config.apiKey) {
-                // Try to refresh token
+            const original = error.config;
+            if (error.response?.status === 401 && this.config.apiKey && original && !original._retried) {
+                original._retried = true;
+                this.config.accessToken = undefined;
                 await this.authenticate();
-                // Retry original request
-                if (error.config) {
-                    return this.axiosInstance.request(error.config);
-                }
+                return this.axiosInstance.request(original);
             }
             throw error;
         });
+    }
+    get baseUrl() {
+        return this.config.baseUrl;
     }
     async authenticate() {
         if (!this.config.apiKey) {
             throw new Error("API key required for authentication");
         }
-        const params = new URLSearchParams({
-            grant_type: "api_key",
-            api_key: this.config.apiKey,
-        });
-        // Use Basic auth with the system credentials for token request
-        const response = await axios.post(`${this.config.baseUrl}/oauth/token`, params, {
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Authorization": "Basic c3lzdGVtOkViNFRRaXpEdFlpYndJTHI=",
-            },
-        });
-        this.config.accessToken = response.data.access_token;
-        this.tokenExpiresAt = Date.now() + response.data.expires_in * 1000;
-        // Set Bearer token for subsequent API requests
-        this.axiosInstance.defaults.headers.common["Authorization"] =
-            `Bearer ${this.config.accessToken}`;
+        // Share one token request between concurrent calls
+        if (!this.authPromise) {
+            this.authPromise = (async () => {
+                const params = new URLSearchParams({
+                    grant_type: "api_key",
+                    api_key: this.config.apiKey,
+                });
+                const response = await axios.post(`${this.config.baseUrl}/oauth/token`, params, {
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": `Basic ${this.config.clientBasic}`,
+                    },
+                });
+                this.config.accessToken = response.data.access_token;
+                this.tokenExpiresAt = Date.now() + response.data.expires_in * 1000;
+            })().finally(() => {
+                this.authPromise = undefined;
+            });
+        }
+        return this.authPromise;
     }
     async ensureAuthenticated() {
         if (!this.config.accessToken) {
@@ -62,6 +78,37 @@ class WorkademyClient {
             // Refresh if token expires in less than 1 minute
             await this.authenticate();
         }
+    }
+    /** Authenticated request on this workspace's host (core API or analytics API). */
+    async request(method, path, options = {}) {
+        await this.ensureAuthenticated();
+        const response = await this.axiosInstance.request({
+            method,
+            url: path,
+            params: options.params,
+            data: options.data,
+        });
+        return response.data;
+    }
+    /** Downloads a pre-signed export file (no auth header). */
+    async download(url) {
+        const response = await axios.get(url, { responseType: "text" });
+        return response.data;
+    }
+    /** Numeric id of the workspace this API key belongs to. */
+    async getWorkspaceId() {
+        if (this.config.workspaceId !== undefined) {
+            return this.config.workspaceId;
+        }
+        const page = await this.request("GET", "/api/v1/secured/workspaces");
+        const host = new URL(this.config.baseUrl).host.toLowerCase();
+        const match = page.content.find((w) => String(w.hostname ?? "").toLowerCase() === host) ??
+            (page.content.length === 1 ? page.content[0] : undefined);
+        if (!match) {
+            throw new Error(`Could not tell which workspace ${host} is; add its "id" to the workspaces file`);
+        }
+        this.config.workspaceId = match.id;
+        return match.id;
     }
     // Course Management
     async listCourses(params) {
@@ -476,35 +523,52 @@ class WorkademyClient {
 // MCP Server Setup
 const server = new Server({
     name: "workademy-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
 }, {
     capabilities: {
         tools: {},
     },
 });
-// Global client instance
-let workademyClient = null;
-// Initialize client
-function getClient() {
-    if (!workademyClient) {
-        const config = {
-            baseUrl: process.env.WORKADEMY_BASE_URL || "https://staging.theworkademy.com",
-            apiKey: process.env.WORKADEMY_API_KEY,
-        };
-        if (!config.apiKey) {
-            throw new McpError(ErrorCode.InvalidRequest, "WORKADEMY_API_KEY environment variable is required");
-        }
-        if (!process.env.WORKADEMY_BASE_URL) {
-            console.warn("WORKADEMY_BASE_URL not set, using default: https://staging.theworkademy.com");
-        }
-        workademyClient = new WorkademyClient(config);
+// Workspaces and one client per workspace
+let registryCache = null;
+function getRegistry() {
+    if (!registryCache) {
+        registryCache = WorkspaceRegistry.load();
     }
-    return workademyClient;
+    return registryCache;
+}
+const clientPool = new Map();
+function getClient(workspace) {
+    let client = clientPool.get(workspace.alias);
+    if (!client) {
+        if (!workspace.apiKey) {
+            throw new McpError(ErrorCode.InvalidRequest, `No API key for workspace "${workspace.alias}"` +
+                (workspace.apiKeyEnv ? ` (environment variable ${workspace.apiKeyEnv} is not set)` : ""));
+        }
+        client = new WorkademyClient({
+            baseUrl: workspace.baseUrl,
+            apiKey: workspace.apiKey,
+            clientBasic: oauthClientBasic(),
+            workspaceId: workspace.id,
+        });
+        clientPool.set(workspace.alias, client);
+    }
+    return client;
+}
+/** Workspace aliases for the tool schemas; null if the configuration cannot be loaded yet. */
+function toolSchemaContext() {
+    try {
+        const registry = getRegistry();
+        return { defaultAlias: registry.defaultAlias, aliases: registry.aliases };
+    }
+    catch {
+        return null;
+    }
 }
 // Tool Definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
-        tools: [
+        tools: decorateTools([
             {
                 name: "analyze_pre_course_survey",
                 description: "Analyze pre-course survey results from saved CSV file. Returns statistics including response frequencies, percentages, and top answers for each question.",
@@ -1152,13 +1216,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     required: ["courseId"],
                 },
             },
-        ],
+            ...EXTENDED_TOOLS,
+        ], toolSchemaContext()),
     };
 });
 // Tool Execution Handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const client = getClient();
+    const toolName = request.params.name;
+    const { workspace: workspaceSelector, ...toolArgs } = (request.params.arguments ?? {});
+    if (toolName === "list_configured_workspaces") {
+        return listConfiguredWorkspaces(getRegistry(), getClient, toolArgs);
+    }
+    const registry = getRegistry();
+    const workspace = registry.resolve(workspaceSelector);
+    assertToolAllowed(workspace, toolName);
+    const client = getClient(workspace);
+    // The handlers below read request.params.arguments; drop the routing argument first.
+    request.params.arguments = toolArgs;
     try {
+        const extended = await handleExtendedTool(toolName, toolArgs, { client, workspace, registry });
+        if (extended) {
+            return extended;
+        }
         switch (request.params.name) {
             // Course Management
             case "list_courses": {
@@ -1584,9 +1663,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     catch (error) {
         if (error instanceof AxiosError) {
-            const errorMessage = error.response?.data?.message || error.message;
+            const data = error.response?.data;
+            const errorMessage = data?.message || data?.error_description || error.message;
             const errorStatus = error.response?.status;
-            throw new McpError(ErrorCode.InternalError, `Workademy API error (${errorStatus}): ${errorMessage}`);
+            const call = `${(error.config?.method ?? "").toUpperCase()} ${error.config?.url ?? ""}`.trim();
+            throw new McpError(ErrorCode.InternalError, `Workademy API error (${errorStatus}) in workspace "${workspace.alias}" on ${call}: ${errorMessage}`);
         }
         throw error;
     }
