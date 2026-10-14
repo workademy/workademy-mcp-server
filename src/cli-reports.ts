@@ -4,7 +4,9 @@
  * Makes the monthly client PDFs for every workspace in workspaces.json (except "report": { "skip": true })
  * and writes reports/<month>/summary.md: who gets the report, who gets the win-back email, what failed.
  */
+import { existsSync, readFileSync, realpathSync } from "fs";
 import * as fs from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 import { WorkspaceRegistry, oauthClientBasic, type WorkspaceConfig } from "./registry.js";
 import { monthlyReport } from "./extended-tools.js";
@@ -16,7 +18,7 @@ import {
   sendDecision,
   type MonthlyPdfResult,
 } from "./monthly-pdf.js";
-import { launchBrowser } from "./report-pdf.js";
+import { REPO_ROOT, launchBrowser } from "./report-pdf.js";
 
 process.env.WORKADEMY_MCP_NO_SERVER = "1";
 // The firewall in front of the API blocks an IP for a few minutes after a burst (see pacing.ts):
@@ -58,6 +60,49 @@ function parseArgs(argv: string[]) {
   return opts;
 }
 
+/**
+ * Keys that only live in the Claude app's config (workspaces with "apiKeyEnv", like EdEra's
+ * WORKADEMY_API_KEY) are read from there, so the terminal run needs no copied keys.
+ * Only the variables the workspaces file names are taken, and only from this server's entry.
+ */
+function keysFromClaudeConfig(names: string[]): string[] {
+  const files = process.env.WORKADEMY_CLAUDE_CONFIG
+    ? [process.env.WORKADEMY_CLAUDE_CONFIG]
+    : [
+        path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json"),
+        path.join(process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming"), "Claude", "claude_desktop_config.json"),
+        path.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json"),
+      ];
+  const entry = path.join(REPO_ROOT, "dist", "index.js");
+  const real = (p: string) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    let servers: Array<{ args?: unknown; env?: Record<string, unknown> }>;
+    try {
+      servers = Object.values(JSON.parse(readFileSync(file, "utf8"))?.mcpServers ?? {});
+    } catch {
+      continue;
+    }
+    const ours = servers.filter((s) => Array.isArray(s.args) && s.args.some((a) => typeof a === "string" && real(a) === real(entry)));
+    const found: string[] = [];
+    for (const name of names) {
+      const value = ours.map((s) => s.env?.[name]).find((v): v is string => typeof v === "string" && v.length > 0);
+      if (value && !process.env[name]) {
+        process.env[name] = value;
+        found.push(name);
+      }
+    }
+    if (found.length) return found;
+  }
+  return [];
+}
+
 function previousMonth(): string {
   const now = new Date();
   const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
@@ -80,7 +125,15 @@ async function main() {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw new Error(`--month must look like 2026-09`);
   if (opts.out) process.env.WORKADEMY_REPORTS_DIR = path.resolve(opts.out);
 
-  const registry = WorkspaceRegistry.load();
+  let registry = WorkspaceRegistry.load();
+  const unset = registry.workspaces.filter((w) => !w.apiKey && w.apiKeyEnv).map((w) => w.apiKeyEnv!);
+  if (unset.length) {
+    const found = keysFromClaudeConfig([...new Set(unset)]);
+    if (found.length) {
+      console.log(`(${found.join(", ")} taken from the Claude app's config)`);
+      registry = WorkspaceRegistry.load();
+    }
+  }
   let workspaces: WorkspaceConfig[] = registry.workspaces;
   if (opts.only) workspaces = opts.only.map((selector) => registry.resolve(selector));
 

@@ -144,6 +144,8 @@ hostname you call. To work with several workspaces, list them in `workspaces.jso
   comment saying who created it, so the client can see and revoke it), adds them to `workspaces.json` and stores the
   keys in `workspaces.keys.json` (permissions 600). Neither the password nor the keys are printed.
   Options: `--list`, `--only "Kognic, Clark"`, `--host`, `--force`. Both files are git-ignored.
+  A workspace that already has an API key answers 409 and gets no second one; it is still listed, so you only
+  need to add the existing key to `workspaces.keys.json` (or keep it in an `apiKeyEnv` variable).
 - A key can also come from an environment variable named in `apiKeyEnv`; it wins over the keys file.
   `WORKADEMY_WORKSPACES_FILE=none` forces the old single-workspace setup.
 - **Read-only by default.** Workspaces from the file refuse tools that change data (create, update, delete,
@@ -216,7 +218,9 @@ The PDFs land in `reports/<month>/<Client>_Workademy_report_<month>.pdf` (git-ig
 was made from (`<workspace>.report.json`, counts only) and `summary.md`:
 who gets the report, who gets the win-back email instead (fewer than 5 completions and fewer than 20 new
 enrolments in the month), and what failed.
-From Claude, `create_monthly_report_pdf` makes one client's PDF.
+From Claude, `create_monthly_report_pdf` makes one client's PDF. Keys kept only in the Claude app's config
+(workspaces with `apiKeyEnv`, e.g. EdEra's `WORKADEMY_API_KEY`) are read from that config's entry for this server,
+so `npm run reports` works in the terminal without copying them.
 
 Workademy's API sits behind a firewall that blocks an IP for a few minutes after a burst of requests (a 403 web page
 instead of a JSON error). The run therefore paces itself (about 4 requests a second, `WORKADEMY_MIN_REQUEST_GAP_MS`)

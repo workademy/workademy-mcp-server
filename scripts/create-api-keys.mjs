@@ -232,7 +232,18 @@ for (const w of selected) {
     };
     results.push(`  created  ${alias} (${w.hostname}, id ${w.id})`);
   } catch (error) {
-    results.push(`  FAILED   ${alias}: ${error.message}`);
+    if (error.status === 409) {
+      // 409: the workspace already has an API key (seen 15 Oct 2026 for EdEra, whose key is in the Claude app's
+      // config). List the workspace anyway, so only the key is missing.
+      config.workspaces[alias] ??= { id: w.id, name: w.name, hostname: w.hostname, readOnly: true };
+      results.push(
+        `  EXISTS   ${alias}: the workspace already has an API key (409), so no second one was made. ` +
+          `If you have that key, add it to ${path.basename(keysPath)} as "${alias}": "<key>"` +
+          (existing.apiKeyEnv ? ` (or keep using ${existing.apiKeyEnv})` : "")
+      );
+    } else {
+      results.push(`  FAILED   ${alias}: ${error.message}`);
+    }
   }
 }
 

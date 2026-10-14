@@ -155,6 +155,7 @@ export async function startMock({
       return page(isUser && userWorkspaces ? userWorkspaces : [{ id: workspaceId, name, hostname: new URL(base).host }], query);
     if (method === "POST" && path === `/api/v1/secured/workspaces/${workspaceId}/api-key`) {
       if (!isUser) return { __status: 403, message: "admins only" };
+      if (state.keyConflict) return { __status: 409, message: "API key already exists" };
       const key = `key-new-${workspaceId}-${state.createdKeys.length + 1}`;
       state.apiKeys.add(key);
       state.createdKeys.push({ key, comment: body?.comment });
@@ -232,6 +233,10 @@ export async function startMock({
         return send(200, { ok: true });
       }
       // like CloudFront's firewall: after `after` more requests, block everything for `ms` with an HTML 403
+      if (path === "/__control/keyconflict") {
+        state.keyConflict = url.searchParams.get("on") !== "0";
+        return send(200, { ok: true });
+      }
       if (path === "/__control/waf") {
         state.waf = { after: Number(url.searchParams.get("after") ?? 0), ms: Number(url.searchParams.get("ms") ?? 1000), until: 0, blocked: 0 };
         return send(200, { ok: true });

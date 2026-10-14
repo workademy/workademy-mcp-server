@@ -449,6 +449,17 @@ await check("creates keys without printing them; the server picks them up", asyn
 
   assert.match(await run("client"), /skipped\s+client-mock: already has a key/);
   assert.equal(b.state.createdKeys.length, 1, "no second key");
+
+  // a workspace that already has a key (EdEra, 15 Oct: 409): explained, workspace kept, nothing overwritten
+  await fetch(`${a.url}/__control/keyconflict?on=1`);
+  const conflict = await runScript(["--file", file, "--host", new URL(a.url).host, "--only", "edera", "--force"], {
+    WORKADEMY_KEYS_SCHEME: "http",
+    WORKADEMY_LOGIN_EMAIL: "olga@example.com",
+    WORKADEMY_LOGIN_PASSWORD: "pw-secret",
+  });
+  await fetch(`${a.url}/__control/keyconflict?on=0`);
+  assert.match(conflict, /EXISTS\s+edera: the workspace already has an API key \(409\)[^\n]*keep using KEY_EDERA/);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).workspaces.edera.apiKeyEnv, "KEY_EDERA", "existing setup kept");
 });
 
 await check("wrong password: clear message, password not echoed", async () => {
@@ -547,6 +558,36 @@ await check("firewall block (403 page): the run waits it out; without waiting it
   assert.match(failed.error, /^Workademy's firewall limited requests from this computer[^]*--only edera\.$/);
   assert.ok(!fs.existsSync(path.join(runDir, "out", "2026-09", "edera.report.json")) || JSON.parse(fs.readFileSync(path.join(runDir, "out", "2026-09", "edera.report.json"), "utf8")).warnings.length === 0, "incomplete numbers are not kept as the month's data");
   await fetch(`${a.url}/__control/waf?after=0&ms=0`); // firewall off again
+});
+
+await check("npm run reports takes a key that only the Claude app's config holds (EdEra's apiKeyEnv)", async () => {
+  const dir = path.join(tmp, "claude-config");
+  fs.mkdirSync(dir);
+  const file = path.join(dir, "workspaces.json");
+  fs.writeFileSync(file, JSON.stringify({ workspaces: { edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_ONLY_IN_CLAUDE", report: { minCompletions: 1e6, minEnrollments: 1e6 } } } }));
+  const claudeConfig = path.join(dir, "claude_desktop_config.json");
+  fs.writeFileSync(
+    claudeConfig,
+    JSON.stringify({
+      mcpServers: {
+        other: { command: "node", args: ["/elsewhere/dist/index.js"], env: { KEY_ONLY_IN_CLAUDE: "wrong-key" } },
+        workademy: { command: "node", args: [path.join(here, "..", "dist", "index.js")], env: { KEY_ONLY_IN_CLAUDE: "key-a" } },
+      },
+    })
+  );
+  let stdout = "";
+  try {
+    ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", path.join(dir, "out")], {
+      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, WORKADEMY_CLAUDE_CONFIG: claudeConfig, WORKADEMY_ASSET_CDN: a.url, WORKADEMY_MIN_REQUEST_GAP_MS: "0" },
+      encoding: "utf8",
+    }));
+  } catch (error) {
+    stdout = error.stdout ?? String(error);
+  }
+  assert.match(stdout, /\(KEY_ONLY_IN_CLAUDE taken from the Claude app's config\)/);
+  const row = JSON.parse(fs.readFileSync(path.join(dir, "out", "2026-09", "summary.json"), "utf8")).rows[0];
+  assert.equal(row.kind, "winback", "numbers came back with the key from this server's entry, not another server's");
+  assert.ok(!stdout.includes("key-a"), "the key is not printed");
 });
 
 await a.close();
