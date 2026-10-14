@@ -151,6 +151,11 @@ class WorkademyClient {
         const response = await this.axiosInstance.get(`/api/v1/secured/groups/${groupId}`);
         return response.data;
     }
+    async listGroupUsers(groupId, params) {
+        await this.ensureAuthenticated();
+        const response = await this.axiosInstance.get(`/api/v1/secured/groups/${groupId}/users`, { params });
+        return response.data;
+    }
     async createGroup(groupData) {
         await this.ensureAuthenticated();
         const response = await this.axiosInstance.post("/api/v1/secured/groups", groupData);
@@ -811,6 +816,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 },
             },
             {
+                name: "list_group_users",
+                description: "List the users (members) of a specific group, paginated",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        groupId: {
+                            type: "number",
+                            description: "The ID of the group",
+                        },
+                        page: {
+                            type: "number",
+                            description: "Page number (0-indexed)",
+                        },
+                        size: {
+                            type: "number",
+                            description: "Number of items per page",
+                        },
+                    },
+                    required: ["groupId"],
+                },
+            },
+            {
                 name: "create_group",
                 description: "Create a new group",
                 inputSchema: {
@@ -1314,6 +1341,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "get_group": {
                 const { groupId } = request.params.arguments;
                 const result = await client.getGroup(groupId);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(result, null, 2),
+                        },
+                    ],
+                };
+            }
+            case "list_group_users": {
+                const { groupId, page, size } = request.params.arguments;
+                const result = await client.listGroupUsers(groupId, { page, size });
                 return {
                     content: [
                         {
