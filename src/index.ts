@@ -136,7 +136,7 @@ export class WorkademyClient implements ApiClient {
   async request<T = any>(
     method: Method,
     path: string,
-    options: { params?: Record<string, any>; data?: any } = {}
+    options: { params?: Record<string, any>; data?: any; timeoutMs?: number } = {}
   ): Promise<T> {
     await this.ensureAuthenticated();
     const response = await this.axiosInstance.request<T>({
@@ -144,6 +144,7 @@ export class WorkademyClient implements ApiClient {
       url: path,
       params: options.params,
       data: options.data,
+      timeout: options.timeoutMs,
     });
     return response.data;
   }

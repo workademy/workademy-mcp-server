@@ -28,6 +28,7 @@ const baseEnv = {
   WORKADEMY_OAUTH_CLIENT_ID: "test-client",
   WORKADEMY_OAUTH_CLIENT_SECRET: "test-secret",
   WORKADEMY_POLL_INTERVAL_MS: "20",
+  WORKADEMY_TODO_TIMEOUT_MS: "500",
   WORKADEMY_EXPORT_DIR: tmp,
 };
 
@@ -69,7 +70,7 @@ async function check(label, fn) {
 const users = { "olga@example.com": "pw-secret" };
 const userWorkspaces = []; // filled once both hosts are known
 const a = await startMock({ workspaceId: 10, name: "EdEra (mock)", apiKey: "key-a", clientBasic: CLIENT_BASIC, host: "127.0.0.1", users, userWorkspaces });
-const b = await startMock({ workspaceId: 20, name: "Client (mock)", apiKey: "key-b", clientBasic: CLIENT_BASIC, analytics: false, host: "localhost", users });
+const b = await startMock({ workspaceId: 20, name: "Client (mock)", apiKey: "key-b", clientBasic: CLIENT_BASIC, analytics: false, host: "localhost", users, slowUngradedMs: 3000 });
 userWorkspaces.push(
   { id: 10, name: "EdEra (mock)", hostname: new URL(a.url).host, admin: true },
   { id: 20, name: "Client (mock)", hostname: new URL(b.url).host, admin: true }
@@ -230,13 +231,20 @@ await check("monthly report (analytics): aggregates, hotspots, small groups hidd
   assert.equal(r.departments.shown[0].suppressedCourses, 1, "2-person cell hidden");
   assert.equal(r.upcomingScheduledRuns.length, 1);
   assert.deepEqual([r.adminTodos.pendingEnrollmentApprovals, r.adminTodos.ungradedOpenAnswers], [1, 4]);
+  const toDateCalls = a.state.log.filter((x) => x.path === "/analytics-api/v1/secured/workspaces/10/facts/usercourse" && x.query.includes("start=0&"));
+  assert.ok(toDateCalls.length > 0 && toDateCalls.every((x) => x.query.includes("aggregationType=MONTH")), "to date = monthly buckets from 0");
+  assert.equal(r.departments.shown[0].members, 12, "members come from /groups/{id}/users, not the list's userCount");
   const text = JSON.stringify(r);
   for (const name of LEARNER_NAMES) assert.ok(!text.includes(name), `leaked ${name}`);
   assert.ok(!text.includes("@client.example"), "leaked an e-mail");
 });
 
 await check("monthly report without analytics access falls back to the core API", async () => {
+  const started = Date.now();
   const r = await call(mcp, "get_monthly_report", { workspace: "client", month: thisMonth });
+  assert.ok(Date.now() - started < 2500, "a slow count must not hold up the report");
+  assert.equal(r.adminTodos.ungradedOpenAnswers, null);
+  assert.ok(r.warnings.some((w) => w === "ungraded open answers: timed out"), "says the count was skipped");
   assert.match(r.sources.enrollments, /core API/);
   assert.equal(r.struggleHotspots, null);
   assert.ok(r.warnings.some((w) => w.includes("Analytics API not available")));
@@ -267,7 +275,7 @@ await check("export_report waits, downloads and saves the CSV", async () => {
 });
 
 await check("get_admin_todos", async () => {
-  const t = await call(mcp, "get_admin_todos", { workspace: "client" });
+  const t = await call(mcp, "get_admin_todos", { workspace: "edera" });
   assert.equal(t.pendingEnrollmentApprovals, 1);
   assert.equal(t.upcomingScheduledRuns[0].item, "Data protection refresher");
 });

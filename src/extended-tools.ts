@@ -101,7 +101,7 @@ const round1 = (value: unknown): number | null =>
 const rate = (part: number, whole: number): number | null =>
   whole > 0 ? Math.round((part / whole) * 1000) / 10 : null;
 const iso = (ms?: number | null): string | null =>
-  typeof ms === "number" && ms > 0 ? new Date(ms).toISOString() : null;
+  typeof ms === "number" && ms >= 0 ? new Date(ms).toISOString() : null;
 const inRange = (ms: unknown, start: number, end: number): boolean =>
   typeof ms === "number" && ms >= start && ms <= end;
 
@@ -157,6 +157,9 @@ function statusOf(error: unknown): number | undefined {
 }
 
 function messageOf(error: unknown): string {
+  if (axios.isAxiosError(error) && error.code === "ECONNABORTED") {
+    return "timed out";
+  }
   if (axios.isAxiosError(error)) {
     const data: any = error.response?.data;
     const detail = data?.message ?? data?.error_description ?? data?.error ?? error.message;
@@ -198,7 +201,7 @@ async function fetchAllPages<T = any>(
   client: ApiClient,
   apiPath: string,
   params: Record<string, any> = {},
-  options: { pageSize?: number; maxPages?: number } = {}
+  options: { pageSize?: number; maxPages?: number; deadline?: number } = {}
 ): Promise<{ items: T[]; total: number; truncated: boolean }> {
   const pageSize = options.pageSize ?? 100;
   const maxPages = options.maxPages ?? 50;
@@ -218,7 +221,7 @@ async function fetchAllPages<T = any>(
       (response?.totalPages !== undefined ? page >= response.totalPages - 1 : content.length < pageSize);
     if (lastPage || content.length === 0) break;
     page += 1;
-    if (page >= maxPages) {
+    if (page >= maxPages || (options.deadline !== undefined && Date.now() > options.deadline)) {
       truncated = true;
       break;
     }
@@ -344,24 +347,33 @@ async function loadCourseNames(client: ApiClient): Promise<{ names: Map<number, 
  * Per-department (group) completion, aggregated. Groups below `minGroupSize` members and
  * group/course cells below `minGroupSize` enrollments are suppressed so nobody can be singled out.
  */
+/** Members of a group. The group list's userCount is not filled (always 0), so ask the group itself. */
+async function memberCount(client: ApiClient, group: any): Promise<number> {
+  if (typeof group.userCount === "number" && group.userCount > 0) return group.userCount;
+  return countOf(client, `/api/v1/secured/groups/${group.id}/users`);
+}
+
 async function groupStats(
   client: ApiClient,
   group: any,
-  options: { period?: Period; minGroupSize: number; courseNames: Map<number, string>; courseId?: number }
+  options: {
+    period?: Period;
+    minGroupSize: number;
+    courseNames: Map<number, string>;
+    courseId?: number;
+    deadline?: number;
+  }
 ) {
+  const members = typeof group.members === "number" ? group.members : await memberCount(client, group);
+  if (members < options.minGroupSize) {
+    return { hidden: true as const };
+  }
   const { items, truncated } = await fetchAllPages<any>(
     client,
     `/api/v1/secured/groups/${group.id}/usercourses`,
     {},
-    { maxPages: 20 }
+    { maxPages: 20, deadline: options.deadline }
   );
-  const members =
-    typeof group.userCount === "number"
-      ? group.userCount
-      : new Set(items.map((uc) => uc.username ?? uc.name ?? uc.id)).size;
-  if (members < options.minGroupSize) {
-    return { hidden: true as const };
-  }
 
   const byCourse = new Map<number, EnrollmentStats>();
   for (const userCourse of items) {
@@ -406,6 +418,48 @@ async function groupStats(
   };
 }
 
+/**
+ * Completion per department for the largest groups. Member counts first (cheap), then
+ * enrollments only for groups big enough to show. Stops at the deadline.
+ */
+async function departmentStats(
+  client: ApiClient,
+  groups: any[],
+  options: {
+    period?: Period;
+    minGroupSize: number;
+    courseNames: Map<number, string>;
+    courseId?: number;
+    limit: number;
+    deadline?: number;
+    warnings: string[];
+  }
+) {
+  const counted = await mapLimit(groups.slice(0, 200), 6, async (group) => ({
+    ...group,
+    members: (await safe(`group ${group.id} members`, options.warnings, () => memberCount(client, group))) ?? 0,
+  }));
+  const eligible = counted.filter((g) => g.members >= options.minGroupSize).sort((a, b) => b.members - a.members);
+  const limited = eligible.slice(0, options.limit);
+  let skippedForTime = 0;
+  const results = await mapLimit(limited, 4, async (group) => {
+    if (options.deadline !== undefined && Date.now() > options.deadline) {
+      skippedForTime += 1;
+      return null;
+    }
+    return safe(`group ${group.id}`, options.warnings, () => groupStats(client, group, options));
+  });
+  if (skippedForTime > 0) {
+    options.warnings.push(`Departments: ${skippedForTime} group(s) skipped to stay within the time limit.`);
+  }
+  const shown = results.filter((r): r is Exclude<typeof r, null | { hidden: true }> => r !== null && !r.hidden);
+  return {
+    shown,
+    hiddenGroups: counted.length - eligible.length,
+    notIncluded: eligible.length - limited.length + skippedForTime,
+  };
+}
+
 async function upcomingSchedules(client: ApiClient, daysAhead: number) {
   const { items } = await fetchAllPages<any>(client, "/api/v1/secured/schedules", {}, { maxPages: 5 });
   const now = Date.now();
@@ -425,8 +479,14 @@ async function adminTodoCounts(client: ApiClient, warnings: string[]) {
   const approvals = await safe("enrollment approvals", warnings, () =>
     fetchAllPages<any>(client, "/api/v1/secured/enrollment-approvals", {}, { maxPages: 5 })
   );
-  const ungraded = await safe("ungraded answers", warnings, () =>
-    countOf(client, "/api/v1/secured/ucqas/_ungraded-open-ended-answers")
+  // This count can take minutes on large workspaces, so it gets its own short limit
+  const ungraded = await safe("ungraded open answers", warnings, () =>
+    client
+      .request<Page<any>>("GET", "/api/v1/secured/ucqas/_ungraded-open-ended-answers", {
+        params: { page: 0, size: 1 },
+        timeoutMs: Number(process.env.WORKADEMY_TODO_TIMEOUT_MS ?? 10_000),
+      })
+      .then((r) => r?.totalElements ?? 0)
   );
   return {
     pendingEnrollmentApprovals: approvals ? approvals.items.filter((a) => a.approved !== true).length : null,
@@ -618,26 +678,22 @@ async function groupCourseStats(ctx: ToolContext, args: Record<string, any>) {
     groups = (await fetchAllPages<any>(client, "/api/v1/secured/groups")).items;
   }
   const limit = clampInt(args.maxGroups, 25, 1, 100);
-  const ordered = [...groups].sort((a, b) => num(b.userCount) - num(a.userCount));
-  if (ordered.length > limit) warnings.push(`Only the ${limit} largest of ${ordered.length} groups were included (maxGroups).`);
-
-  const results = await mapLimit(ordered.slice(0, limit), 3, (group) =>
-    safe(`group ${group.id}`, warnings, () =>
-      groupStats(client, group, {
-        period,
-        minGroupSize,
-        courseNames: names,
-        courseId: args.courseId !== undefined ? Number(args.courseId) : undefined,
-      })
-    )
-  );
-  const shown = results.filter((r): r is Exclude<typeof r, null | { hidden: true }> => r !== null && !r.hidden);
+  const result = await departmentStats(client, groups, {
+    period,
+    minGroupSize,
+    courseNames: names,
+    courseId: args.courseId !== undefined ? Number(args.courseId) : undefined,
+    limit,
+    deadline: Date.now() + Number(process.env.WORKADEMY_REPORT_BUDGET_MS ?? 40_000),
+    warnings,
+  });
+  if (result.notIncluded > 0) warnings.push(`${result.notIncluded} large enough group(s) were not included (maxGroups or time limit).`);
   return {
     workspace: ctx.workspace.alias,
     period: period ? { start: iso(period.start), end: iso(period.end) } : null,
     privacy: `Aggregates only. Groups with fewer than ${minGroupSize} members and group/course cells with fewer than ${minGroupSize} enrollments are hidden.`,
-    groups: shown,
-    hiddenGroups: results.filter((r) => r !== null && r.hidden).length,
+    groups: result.shown,
+    hiddenGroups: result.hiddenGroups,
     warnings,
   };
 }
@@ -714,17 +770,12 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
   const warnings: string[] = [];
   const sources: Record<string, string> = {};
 
+  // Large workspaces can be slow: the report has a time budget so it always answers
+  // (the device bridge gives a tool 60 s). Sections that run out of time say so in warnings.
+  const deadline = Date.now() + Number(process.env.WORKADEMY_REPORT_BUDGET_MS ?? 40_000);
+  const timeLeft = () => Date.now() < deadline;
   const workspaceId = await client.getWorkspaceId();
-  const info = await safe("workspace", warnings, () =>
-    client.request<any>("GET", `/api/v1/secured/workspaces/${workspaceId}`)
-  );
-  const since = typeof info?.createTime === "number" ? info.createTime : 0;
-
-  // Large workspaces have thousands of courses: count them here, load the full list only for the fallback
-  const courseCount = await safe("course count", warnings, () => countOf(client, "/api/v1/secured/courses"));
   const courseNames = new Map<number, string>();
-  const userCount = await safe("users", warnings, () => countOf(client, "/api/v1/secured/users"));
-  const groupList = await safe("groups", warnings, () => fetchAllPages<any>(client, "/api/v1/secured/groups"));
 
   // --- Analytics service (same numbers the client sees on their dashboard) ---
   let analyticsAvailable = true;
@@ -735,11 +786,13 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
     } catch (error) {
       const status = statusOf(error);
       if (status === 401 || status === 403 || status === 404) {
+        if (analyticsAvailable) {
+          warnings.push(
+            `Analytics API not available for this workspace (${messageOf(error)}). ` +
+              "Enrollment numbers were computed from the core API; logins, activity and question hotspots are missing."
+          );
+        }
         analyticsAvailable = false;
-        warnings.push(
-          `Analytics API not available for this workspace (${messageOf(error)}). ` +
-            "Enrollment numbers were computed from the core API; logins, activity and question hotspots are missing."
-        );
       } else {
         warnings.push(`analytics ${label}: ${messageOf(error)}`);
       }
@@ -747,49 +800,44 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
     }
   };
   const periodWindow = { start: period.start, end: period.end };
-  const toDateWindow = { start: since, end: period.end };
-
-  // Workspace totals (one row) for the headline; per-course rows sorted so the biggest courses come first
-  const totalsToDate = await facts("totals to date", {
-    fact: "usercourse",
-    breakdown: "none",
-    ...toDateWindow,
-    aggregationType: "YEAR",
-  });
-  const totalsPeriod = await facts("totals this month", {
-    fact: "usercourse",
-    breakdown: "none",
-    ...periodWindow,
-    aggregationType: "MONTH",
-  });
-  const certTotalsPeriod = await facts("certificates this month", {
-    fact: "certificate",
-    breakdown: "none",
-    ...periodWindow,
-    aggregationType: "MONTH",
-  });
+  // The analytics service only counts whole buckets that lie inside the window, and yearly buckets
+  // only exist for finished years. So "to date" = monthly buckets from the very beginning.
+  const toDateWindow = { start: 0, end: period.end };
   const perCourse = { breakdown: "course" as const, size: 100, sort: "amountStarted", sortDir: "desc" as const };
-  const enrollToDate = await facts("enrollments to date", {
-    fact: "usercourse",
-    ...perCourse,
-    ...toDateWindow,
-    aggregationType: "YEAR",
-  });
-  const enrollPeriod = await facts("enrollments this month", {
-    fact: "usercourse",
-    ...perCourse,
-    ...periodWindow,
-    aggregationType: "MONTH",
-  });
-  const certsPeriod = await facts("certificates", {
-    fact: "certificate",
-    ...perCourse,
-    sort: "amountIssued",
-    ...periodWindow,
-    aggregationType: "MONTH",
-  });
-  const usersPeriod = await facts("logins", { fact: "workspace_users", ...periodWindow, aggregationType: "MONTH" });
-  const activity = await facts("activity", { fact: "activity", ...periodWindow, aggregationType: "MONTH" });
+  const month = { aggregationType: "MONTH" as const };
+
+  // Independent calls run in parallel (the slowest take a few seconds on large workspaces)
+  const [
+    info,
+    courseCount,
+    userCount,
+    groupList,
+    totalsToDate,
+    totalsPeriod,
+    certTotalsPeriod,
+    enrollToDate,
+    enrollPeriod,
+    certsPeriod,
+    usersPeriod,
+    activity,
+    upcoming,
+    todos,
+  ] = await Promise.all([
+    safe("workspace", warnings, () => client.request<any>("GET", `/api/v1/secured/workspaces/${workspaceId}`)),
+    safe("course count", warnings, () => countOf(client, "/api/v1/secured/courses")),
+    safe("users", warnings, () => countOf(client, "/api/v1/secured/users")),
+    safe("groups", warnings, () => fetchAllPages<any>(client, "/api/v1/secured/groups")),
+    facts("totals to date", { fact: "usercourse", breakdown: "none", ...toDateWindow, ...month }),
+    facts("totals this month", { fact: "usercourse", breakdown: "none", ...periodWindow, ...month }),
+    facts("certificates this month", { fact: "certificate", breakdown: "none", ...periodWindow, ...month }),
+    facts("enrollments to date", { fact: "usercourse", ...perCourse, ...toDateWindow, ...month }),
+    facts("enrollments this month", { fact: "usercourse", ...perCourse, ...periodWindow, ...month }),
+    facts("certificates", { fact: "certificate", ...perCourse, sort: "amountIssued", ...periodWindow, ...month }),
+    facts("logins", { fact: "workspace_users", ...periodWindow, ...month }),
+    facts("activity", { fact: "activity", ...periodWindow, ...month }),
+    safe("schedules", warnings, () => upcomingSchedules(client, 31)),
+    adminTodoCounts(client, warnings),
+  ]);
 
   // --- Courses ---
   type CourseRow = {
@@ -884,82 +932,92 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
   const finishedThisMonth = totalPeriod ? num(totalPeriod.amountEnded) : sum((c) => c.thisMonth.finished);
 
   // --- Where people struggle: drill course -> module -> lecture -> question on wrong answers ---
-  let hotspots: Record<string, any> | null = null;
-  if (analyticsAvailable && courses.length > 0) {
-    sources.questions = "analytics API";
-    const candidates = [...courses]
-      .sort((a, b) => num(b.thisMonth.enrolled) - num(a.thisMonth.enrolled) || num(b.toDate.enrolled) - num(a.toDate.enrolled))
-      .slice(0, 5)
-      .map((c) => c.courseId);
-    const quiet = (query: FactQuery) =>
-      safe(`questions ${query.courseId}/${query.moduleId ?? ""}/${query.lectureId ?? ""}`, warnings, () =>
-        fetchFacts(client, workspaceId, query)
-      );
-    const byWrong = (a: any, b: any) => num(b.amountWrong) - num(a.amountWrong);
-    const collect = async (window: { start: number; end: number }) => {
-      const found: any[] = [];
-      const base = { fact: "questionanswer" as const, ...window, aggregationType: "MONTH" as const, size: 200 };
-      await mapLimit(candidates, 2, async (courseId) => {
-        const modules = await quiet({ ...base, courseId });
-        const topModules = (modules?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
-        for (const module of topModules) {
-          const lectures = await quiet({ ...base, courseId, moduleId: module.moduleId });
-          const topLectures = (lectures?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
-          for (const lecture of topLectures) {
-            const questions = await quiet({ ...base, courseId, moduleId: module.moduleId, lectureId: lecture.lectureId });
-            for (const q of questions?.rows ?? []) {
-              const correct = num(q.amountCorrect);
-              const wrong = num(q.amountWrong);
-              if (correct + wrong < minGroupSize || wrong === 0) continue;
-              found.push({
-                course: courseNames.get(courseId) ?? q.courseName ?? String(courseId),
-                module: module.moduleName ?? String(module.moduleId),
-                lecture: lecture.lectureName ?? String(lecture.lectureId),
-                question: q.question ?? String(q.questionAnswerId),
-                correctAnswers: correct,
-                wrongAnswers: wrong,
-                wrongRate: rate(wrong, correct + wrong),
-                avgAttempts: round1(q.avgWrongAttempts),
-              });
+  const computeHotspots = async (): Promise<Record<string, any> | null> => {
+    let hotspots: Record<string, any> | null = null;
+    if (analyticsAvailable && courses.length > 0) {
+      sources.questions = "analytics API";
+      const candidates = [...courses]
+        .sort((a, b) => num(b.thisMonth.enrolled) - num(a.thisMonth.enrolled) || num(b.toDate.enrolled) - num(a.toDate.enrolled))
+        .slice(0, 5)
+        .map((c) => c.courseId);
+      let outOfTime = false;
+      const quiet = async (query: FactQuery) => {
+        if (!timeLeft()) {
+          outOfTime = true;
+          return null;
+        }
+        return safe(`questions ${query.courseId}/${query.moduleId ?? ""}/${query.lectureId ?? ""}`, warnings, () =>
+          fetchFacts(client, workspaceId, query)
+        );
+      };
+      const byWrong = (a: any, b: any) => num(b.amountWrong) - num(a.amountWrong);
+      const collect = async (window: { start: number; end: number }) => {
+        const found: any[] = [];
+        const base = { fact: "questionanswer" as const, ...window, aggregationType: "MONTH" as const, size: 200 };
+        await mapLimit(candidates, 2, async (courseId) => {
+          const modules = await quiet({ ...base, courseId });
+          const topModules = (modules?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
+          for (const module of topModules) {
+            const lectures = await quiet({ ...base, courseId, moduleId: module.moduleId });
+            const topLectures = (lectures?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
+            for (const lecture of topLectures) {
+              const questions = await quiet({ ...base, courseId, moduleId: module.moduleId, lectureId: lecture.lectureId });
+              for (const q of questions?.rows ?? []) {
+                const correct = num(q.amountCorrect);
+                const wrong = num(q.amountWrong);
+                if (correct + wrong < minGroupSize || wrong === 0) continue;
+                found.push({
+                  course: courseNames.get(courseId) ?? q.courseName ?? String(courseId),
+                  module: module.moduleName ?? String(module.moduleId),
+                  lecture: lecture.lectureName ?? String(lecture.lectureId),
+                  question: q.question ?? String(q.questionAnswerId),
+                  correctAnswers: correct,
+                  wrongAnswers: wrong,
+                  wrongRate: rate(wrong, correct + wrong),
+                  avgAttempts: round1(q.avgWrongAttempts),
+                });
+              }
             }
           }
-        }
-      });
-      return found.sort((a, b) => b.wrongAnswers - a.wrongAnswers || num(b.wrongRate) - num(a.wrongRate));
-    };
-    let window = "this month";
-    let found = await collect(periodWindow);
-    if (found.length === 0) {
-      window = "since the workspace started (too few answers this month)";
-      found = await collect(toDateWindow);
+        });
+        return found.sort((a, b) => b.wrongAnswers - a.wrongAnswers || num(b.wrongRate) - num(a.wrongRate));
+      };
+      let window = "this month";
+      let found = await collect(periodWindow);
+      if (found.length === 0 && timeLeft()) {
+        window = "since the workspace started (too few answers this month)";
+        found = await collect(toDateWindow);
+      }
+      if (outOfTime) warnings.push("Question hotspots: stopped early to stay within the time limit.");
+      hotspots = {
+        window,
+        minAnswers: minGroupSize,
+        questions: found.slice(0, topQuestions),
+      };
     }
-    hotspots = {
-      window,
-      minAnswers: minGroupSize,
-      questions: found.slice(0, topQuestions),
-    };
-  }
+    return hotspots;
+  };
 
   // --- Departments (groups) ---
-  let departments: Record<string, any> | null = null;
-  if (includeDepartments && groupList) {
+  const computeDepartments = async (): Promise<Record<string, any> | null> => {
+    if (!includeDepartments || !groupList) return null;
     sources.departments = "core API (group enrollments)";
-    const ordered = [...groupList.items]
-      .filter((g) => typeof g.userCount !== "number" || g.userCount >= minGroupSize)
-      .sort((a, b) => num(b.userCount) - num(a.userCount));
-    const limited = ordered.slice(0, 25);
-    const results = await mapLimit(limited, 3, (group) =>
-      safe(`group ${group.id}`, warnings, () =>
-        groupStats(client, group, { period: periodWindow, minGroupSize, courseNames })
-      )
-    );
-    const shown = results.filter((r): r is Exclude<typeof r, null | { hidden: true }> => r !== null && !r.hidden);
-    departments = {
-      shown: shown.map(({ groupId, truncated, ...rest }) => rest),
-      hiddenGroups: groupList.items.length - shown.length - (ordered.length - limited.length),
-      notIncluded: ordered.length - limited.length,
+    const result = await departmentStats(client, groupList.items, {
+      period: periodWindow,
+      minGroupSize,
+      courseNames,
+      limit: 25,
+      deadline,
+      warnings,
+    });
+    return {
+      shown: result.shown.map(({ groupId, truncated, ...rest }) => rest),
+      hiddenGroups: result.hiddenGroups,
+      notIncluded: result.notIncluded,
     };
-  }
+  };
+
+  const [hotspots, departments] = await Promise.all([computeHotspots(), computeDepartments()]);
 
   // --- Engagement, upcoming, admin to-dos ---
   const engagement =
@@ -970,8 +1028,6 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
           activeUsers: activity?.data?.activityCount ?? activity?.rows?.[0]?.activityCount ?? null,
         }
       : null;
-  const upcoming = await safe("schedules", warnings, () => upcomingSchedules(client, 31));
-  const todos = await adminTodoCounts(client, warnings);
 
   const certificatesThisMonth = certTotalsPeriod?.rows?.[0]
     ? num(certTotalsPeriod.rows[0].amountIssued)

@@ -87,6 +87,7 @@ export class WorkademyClient {
             url: path,
             params: options.params,
             data: options.data,
+            timeout: options.timeoutMs,
         });
         return response.data;
     }

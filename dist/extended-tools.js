@@ -66,7 +66,7 @@ const round1 = (value) => value === undefined || value === null || !Number.isFin
     : Math.round(Number(value) * 10) / 10;
 /** Percentage with one decimal, or null when there is nothing to divide by. */
 const rate = (part, whole) => whole > 0 ? Math.round((part / whole) * 1000) / 10 : null;
-const iso = (ms) => typeof ms === "number" && ms > 0 ? new Date(ms).toISOString() : null;
+const iso = (ms) => typeof ms === "number" && ms >= 0 ? new Date(ms).toISOString() : null;
 const inRange = (ms, start, end) => typeof ms === "number" && ms >= start && ms <= end;
 function clampInt(value, fallback, min, max) {
     const n = Math.round(Number(value));
@@ -121,6 +121,9 @@ function statusOf(error) {
     return axios.isAxiosError(error) ? error.response?.status : undefined;
 }
 function messageOf(error) {
+    if (axios.isAxiosError(error) && error.code === "ECONNABORTED") {
+        return "timed out";
+    }
     if (axios.isAxiosError(error)) {
         const data = error.response?.data;
         const detail = data?.message ?? data?.error_description ?? data?.error ?? error.message;
@@ -168,7 +171,7 @@ async function fetchAllPages(client, apiPath, params = {}, options = {}) {
         if (lastPage || content.length === 0)
             break;
         page += 1;
-        if (page >= maxPages) {
+        if (page >= maxPages || (options.deadline !== undefined && Date.now() > options.deadline)) {
             truncated = true;
             break;
         }
@@ -280,14 +283,18 @@ async function loadCourseNames(client) {
  * Per-department (group) completion, aggregated. Groups below `minGroupSize` members and
  * group/course cells below `minGroupSize` enrollments are suppressed so nobody can be singled out.
  */
+/** Members of a group. The group list's userCount is not filled (always 0), so ask the group itself. */
+async function memberCount(client, group) {
+    if (typeof group.userCount === "number" && group.userCount > 0)
+        return group.userCount;
+    return countOf(client, `/api/v1/secured/groups/${group.id}/users`);
+}
 async function groupStats(client, group, options) {
-    const { items, truncated } = await fetchAllPages(client, `/api/v1/secured/groups/${group.id}/usercourses`, {}, { maxPages: 20 });
-    const members = typeof group.userCount === "number"
-        ? group.userCount
-        : new Set(items.map((uc) => uc.username ?? uc.name ?? uc.id)).size;
+    const members = typeof group.members === "number" ? group.members : await memberCount(client, group);
     if (members < options.minGroupSize) {
         return { hidden: true };
     }
+    const { items, truncated } = await fetchAllPages(client, `/api/v1/secured/groups/${group.id}/usercourses`, {}, { maxPages: 20, deadline: options.deadline });
     const byCourse = new Map();
     for (const userCourse of items) {
         const courseId = userCourse?.course?.id ?? userCourse?.courseId;
@@ -332,6 +339,35 @@ async function groupStats(client, group, options) {
         truncated,
     };
 }
+/**
+ * Completion per department for the largest groups. Member counts first (cheap), then
+ * enrollments only for groups big enough to show. Stops at the deadline.
+ */
+async function departmentStats(client, groups, options) {
+    const counted = await mapLimit(groups.slice(0, 200), 6, async (group) => ({
+        ...group,
+        members: (await safe(`group ${group.id} members`, options.warnings, () => memberCount(client, group))) ?? 0,
+    }));
+    const eligible = counted.filter((g) => g.members >= options.minGroupSize).sort((a, b) => b.members - a.members);
+    const limited = eligible.slice(0, options.limit);
+    let skippedForTime = 0;
+    const results = await mapLimit(limited, 4, async (group) => {
+        if (options.deadline !== undefined && Date.now() > options.deadline) {
+            skippedForTime += 1;
+            return null;
+        }
+        return safe(`group ${group.id}`, options.warnings, () => groupStats(client, group, options));
+    });
+    if (skippedForTime > 0) {
+        options.warnings.push(`Departments: ${skippedForTime} group(s) skipped to stay within the time limit.`);
+    }
+    const shown = results.filter((r) => r !== null && !r.hidden);
+    return {
+        shown,
+        hiddenGroups: counted.length - eligible.length,
+        notIncluded: eligible.length - limited.length + skippedForTime,
+    };
+}
 async function upcomingSchedules(client, daysAhead) {
     const { items } = await fetchAllPages(client, "/api/v1/secured/schedules", {}, { maxPages: 5 });
     const now = Date.now();
@@ -348,7 +384,13 @@ async function upcomingSchedules(client, daysAhead) {
 }
 async function adminTodoCounts(client, warnings) {
     const approvals = await safe("enrollment approvals", warnings, () => fetchAllPages(client, "/api/v1/secured/enrollment-approvals", {}, { maxPages: 5 }));
-    const ungraded = await safe("ungraded answers", warnings, () => countOf(client, "/api/v1/secured/ucqas/_ungraded-open-ended-answers"));
+    // This count can take minutes on large workspaces, so it gets its own short limit
+    const ungraded = await safe("ungraded open answers", warnings, () => client
+        .request("GET", "/api/v1/secured/ucqas/_ungraded-open-ended-answers", {
+        params: { page: 0, size: 1 },
+        timeoutMs: Number(process.env.WORKADEMY_TODO_TIMEOUT_MS ?? 10_000),
+    })
+        .then((r) => r?.totalElements ?? 0));
     return {
         pendingEnrollmentApprovals: approvals ? approvals.items.filter((a) => a.approved !== true).length : null,
         ungradedOpenAnswers: ungraded,
@@ -528,22 +570,23 @@ async function groupCourseStats(ctx, args) {
         groups = (await fetchAllPages(client, "/api/v1/secured/groups")).items;
     }
     const limit = clampInt(args.maxGroups, 25, 1, 100);
-    const ordered = [...groups].sort((a, b) => num(b.userCount) - num(a.userCount));
-    if (ordered.length > limit)
-        warnings.push(`Only the ${limit} largest of ${ordered.length} groups were included (maxGroups).`);
-    const results = await mapLimit(ordered.slice(0, limit), 3, (group) => safe(`group ${group.id}`, warnings, () => groupStats(client, group, {
+    const result = await departmentStats(client, groups, {
         period,
         minGroupSize,
         courseNames: names,
         courseId: args.courseId !== undefined ? Number(args.courseId) : undefined,
-    })));
-    const shown = results.filter((r) => r !== null && !r.hidden);
+        limit,
+        deadline: Date.now() + Number(process.env.WORKADEMY_REPORT_BUDGET_MS ?? 40_000),
+        warnings,
+    });
+    if (result.notIncluded > 0)
+        warnings.push(`${result.notIncluded} large enough group(s) were not included (maxGroups or time limit).`);
     return {
         workspace: ctx.workspace.alias,
         period: period ? { start: iso(period.start), end: iso(period.end) } : null,
         privacy: `Aggregates only. Groups with fewer than ${minGroupSize} members and group/course cells with fewer than ${minGroupSize} enrollments are hidden.`,
-        groups: shown,
-        hiddenGroups: results.filter((r) => r !== null && r.hidden).length,
+        groups: result.shown,
+        hiddenGroups: result.hiddenGroups,
         warnings,
     };
 }
@@ -615,14 +658,12 @@ async function monthlyReport(ctx, args) {
     const includeDepartments = args.includeDepartments !== false;
     const warnings = [];
     const sources = {};
+    // Large workspaces can be slow: the report has a time budget so it always answers
+    // (the device bridge gives a tool 60 s). Sections that run out of time say so in warnings.
+    const deadline = Date.now() + Number(process.env.WORKADEMY_REPORT_BUDGET_MS ?? 40_000);
+    const timeLeft = () => Date.now() < deadline;
     const workspaceId = await client.getWorkspaceId();
-    const info = await safe("workspace", warnings, () => client.request("GET", `/api/v1/secured/workspaces/${workspaceId}`));
-    const since = typeof info?.createTime === "number" ? info.createTime : 0;
-    // Large workspaces have thousands of courses: count them here, load the full list only for the fallback
-    const courseCount = await safe("course count", warnings, () => countOf(client, "/api/v1/secured/courses"));
     const courseNames = new Map();
-    const userCount = await safe("users", warnings, () => countOf(client, "/api/v1/secured/users"));
-    const groupList = await safe("groups", warnings, () => fetchAllPages(client, "/api/v1/secured/groups"));
     // --- Analytics service (same numbers the client sees on their dashboard) ---
     let analyticsAvailable = true;
     const facts = async (label, query) => {
@@ -634,9 +675,11 @@ async function monthlyReport(ctx, args) {
         catch (error) {
             const status = statusOf(error);
             if (status === 401 || status === 403 || status === 404) {
+                if (analyticsAvailable) {
+                    warnings.push(`Analytics API not available for this workspace (${messageOf(error)}). ` +
+                        "Enrollment numbers were computed from the core API; logins, activity and question hotspots are missing.");
+                }
                 analyticsAvailable = false;
-                warnings.push(`Analytics API not available for this workspace (${messageOf(error)}). ` +
-                    "Enrollment numbers were computed from the core API; logins, activity and question hotspots are missing.");
             }
             else {
                 warnings.push(`analytics ${label}: ${messageOf(error)}`);
@@ -645,48 +688,28 @@ async function monthlyReport(ctx, args) {
         }
     };
     const periodWindow = { start: period.start, end: period.end };
-    const toDateWindow = { start: since, end: period.end };
-    // Workspace totals (one row) for the headline; per-course rows sorted so the biggest courses come first
-    const totalsToDate = await facts("totals to date", {
-        fact: "usercourse",
-        breakdown: "none",
-        ...toDateWindow,
-        aggregationType: "YEAR",
-    });
-    const totalsPeriod = await facts("totals this month", {
-        fact: "usercourse",
-        breakdown: "none",
-        ...periodWindow,
-        aggregationType: "MONTH",
-    });
-    const certTotalsPeriod = await facts("certificates this month", {
-        fact: "certificate",
-        breakdown: "none",
-        ...periodWindow,
-        aggregationType: "MONTH",
-    });
+    // The analytics service only counts whole buckets that lie inside the window, and yearly buckets
+    // only exist for finished years. So "to date" = monthly buckets from the very beginning.
+    const toDateWindow = { start: 0, end: period.end };
     const perCourse = { breakdown: "course", size: 100, sort: "amountStarted", sortDir: "desc" };
-    const enrollToDate = await facts("enrollments to date", {
-        fact: "usercourse",
-        ...perCourse,
-        ...toDateWindow,
-        aggregationType: "YEAR",
-    });
-    const enrollPeriod = await facts("enrollments this month", {
-        fact: "usercourse",
-        ...perCourse,
-        ...periodWindow,
-        aggregationType: "MONTH",
-    });
-    const certsPeriod = await facts("certificates", {
-        fact: "certificate",
-        ...perCourse,
-        sort: "amountIssued",
-        ...periodWindow,
-        aggregationType: "MONTH",
-    });
-    const usersPeriod = await facts("logins", { fact: "workspace_users", ...periodWindow, aggregationType: "MONTH" });
-    const activity = await facts("activity", { fact: "activity", ...periodWindow, aggregationType: "MONTH" });
+    const month = { aggregationType: "MONTH" };
+    // Independent calls run in parallel (the slowest take a few seconds on large workspaces)
+    const [info, courseCount, userCount, groupList, totalsToDate, totalsPeriod, certTotalsPeriod, enrollToDate, enrollPeriod, certsPeriod, usersPeriod, activity, upcoming, todos,] = await Promise.all([
+        safe("workspace", warnings, () => client.request("GET", `/api/v1/secured/workspaces/${workspaceId}`)),
+        safe("course count", warnings, () => countOf(client, "/api/v1/secured/courses")),
+        safe("users", warnings, () => countOf(client, "/api/v1/secured/users")),
+        safe("groups", warnings, () => fetchAllPages(client, "/api/v1/secured/groups")),
+        facts("totals to date", { fact: "usercourse", breakdown: "none", ...toDateWindow, ...month }),
+        facts("totals this month", { fact: "usercourse", breakdown: "none", ...periodWindow, ...month }),
+        facts("certificates this month", { fact: "certificate", breakdown: "none", ...periodWindow, ...month }),
+        facts("enrollments to date", { fact: "usercourse", ...perCourse, ...toDateWindow, ...month }),
+        facts("enrollments this month", { fact: "usercourse", ...perCourse, ...periodWindow, ...month }),
+        facts("certificates", { fact: "certificate", ...perCourse, sort: "amountIssued", ...periodWindow, ...month }),
+        facts("logins", { fact: "workspace_users", ...periodWindow, ...month }),
+        facts("activity", { fact: "activity", ...periodWindow, ...month }),
+        safe("schedules", warnings, () => upcomingSchedules(client, 31)),
+        adminTodoCounts(client, warnings),
+    ]);
     let courses = [];
     let coursesWithActivity = null;
     if (enrollToDate?.rows) {
@@ -774,75 +797,91 @@ async function monthlyReport(ctx, args) {
     const enrolledThisMonth = totalPeriod ? num(totalPeriod.amountStarted) : sum((c) => c.thisMonth.enrolled);
     const finishedThisMonth = totalPeriod ? num(totalPeriod.amountEnded) : sum((c) => c.thisMonth.finished);
     // --- Where people struggle: drill course -> module -> lecture -> question on wrong answers ---
-    let hotspots = null;
-    if (analyticsAvailable && courses.length > 0) {
-        sources.questions = "analytics API";
-        const candidates = [...courses]
-            .sort((a, b) => num(b.thisMonth.enrolled) - num(a.thisMonth.enrolled) || num(b.toDate.enrolled) - num(a.toDate.enrolled))
-            .slice(0, 5)
-            .map((c) => c.courseId);
-        const quiet = (query) => safe(`questions ${query.courseId}/${query.moduleId ?? ""}/${query.lectureId ?? ""}`, warnings, () => fetchFacts(client, workspaceId, query));
-        const byWrong = (a, b) => num(b.amountWrong) - num(a.amountWrong);
-        const collect = async (window) => {
-            const found = [];
-            const base = { fact: "questionanswer", ...window, aggregationType: "MONTH", size: 200 };
-            await mapLimit(candidates, 2, async (courseId) => {
-                const modules = await quiet({ ...base, courseId });
-                const topModules = (modules?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
-                for (const module of topModules) {
-                    const lectures = await quiet({ ...base, courseId, moduleId: module.moduleId });
-                    const topLectures = (lectures?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
-                    for (const lecture of topLectures) {
-                        const questions = await quiet({ ...base, courseId, moduleId: module.moduleId, lectureId: lecture.lectureId });
-                        for (const q of questions?.rows ?? []) {
-                            const correct = num(q.amountCorrect);
-                            const wrong = num(q.amountWrong);
-                            if (correct + wrong < minGroupSize || wrong === 0)
-                                continue;
-                            found.push({
-                                course: courseNames.get(courseId) ?? q.courseName ?? String(courseId),
-                                module: module.moduleName ?? String(module.moduleId),
-                                lecture: lecture.lectureName ?? String(lecture.lectureId),
-                                question: q.question ?? String(q.questionAnswerId),
-                                correctAnswers: correct,
-                                wrongAnswers: wrong,
-                                wrongRate: rate(wrong, correct + wrong),
-                                avgAttempts: round1(q.avgWrongAttempts),
-                            });
+    const computeHotspots = async () => {
+        let hotspots = null;
+        if (analyticsAvailable && courses.length > 0) {
+            sources.questions = "analytics API";
+            const candidates = [...courses]
+                .sort((a, b) => num(b.thisMonth.enrolled) - num(a.thisMonth.enrolled) || num(b.toDate.enrolled) - num(a.toDate.enrolled))
+                .slice(0, 5)
+                .map((c) => c.courseId);
+            let outOfTime = false;
+            const quiet = async (query) => {
+                if (!timeLeft()) {
+                    outOfTime = true;
+                    return null;
+                }
+                return safe(`questions ${query.courseId}/${query.moduleId ?? ""}/${query.lectureId ?? ""}`, warnings, () => fetchFacts(client, workspaceId, query));
+            };
+            const byWrong = (a, b) => num(b.amountWrong) - num(a.amountWrong);
+            const collect = async (window) => {
+                const found = [];
+                const base = { fact: "questionanswer", ...window, aggregationType: "MONTH", size: 200 };
+                await mapLimit(candidates, 2, async (courseId) => {
+                    const modules = await quiet({ ...base, courseId });
+                    const topModules = (modules?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
+                    for (const module of topModules) {
+                        const lectures = await quiet({ ...base, courseId, moduleId: module.moduleId });
+                        const topLectures = (lectures?.rows ?? []).filter((r) => num(r.amountWrong) > 0).sort(byWrong).slice(0, 2);
+                        for (const lecture of topLectures) {
+                            const questions = await quiet({ ...base, courseId, moduleId: module.moduleId, lectureId: lecture.lectureId });
+                            for (const q of questions?.rows ?? []) {
+                                const correct = num(q.amountCorrect);
+                                const wrong = num(q.amountWrong);
+                                if (correct + wrong < minGroupSize || wrong === 0)
+                                    continue;
+                                found.push({
+                                    course: courseNames.get(courseId) ?? q.courseName ?? String(courseId),
+                                    module: module.moduleName ?? String(module.moduleId),
+                                    lecture: lecture.lectureName ?? String(lecture.lectureId),
+                                    question: q.question ?? String(q.questionAnswerId),
+                                    correctAnswers: correct,
+                                    wrongAnswers: wrong,
+                                    wrongRate: rate(wrong, correct + wrong),
+                                    avgAttempts: round1(q.avgWrongAttempts),
+                                });
+                            }
                         }
                     }
-                }
-            });
-            return found.sort((a, b) => b.wrongAnswers - a.wrongAnswers || num(b.wrongRate) - num(a.wrongRate));
-        };
-        let window = "this month";
-        let found = await collect(periodWindow);
-        if (found.length === 0) {
-            window = "since the workspace started (too few answers this month)";
-            found = await collect(toDateWindow);
+                });
+                return found.sort((a, b) => b.wrongAnswers - a.wrongAnswers || num(b.wrongRate) - num(a.wrongRate));
+            };
+            let window = "this month";
+            let found = await collect(periodWindow);
+            if (found.length === 0 && timeLeft()) {
+                window = "since the workspace started (too few answers this month)";
+                found = await collect(toDateWindow);
+            }
+            if (outOfTime)
+                warnings.push("Question hotspots: stopped early to stay within the time limit.");
+            hotspots = {
+                window,
+                minAnswers: minGroupSize,
+                questions: found.slice(0, topQuestions),
+            };
         }
-        hotspots = {
-            window,
-            minAnswers: minGroupSize,
-            questions: found.slice(0, topQuestions),
-        };
-    }
+        return hotspots;
+    };
     // --- Departments (groups) ---
-    let departments = null;
-    if (includeDepartments && groupList) {
+    const computeDepartments = async () => {
+        if (!includeDepartments || !groupList)
+            return null;
         sources.departments = "core API (group enrollments)";
-        const ordered = [...groupList.items]
-            .filter((g) => typeof g.userCount !== "number" || g.userCount >= minGroupSize)
-            .sort((a, b) => num(b.userCount) - num(a.userCount));
-        const limited = ordered.slice(0, 25);
-        const results = await mapLimit(limited, 3, (group) => safe(`group ${group.id}`, warnings, () => groupStats(client, group, { period: periodWindow, minGroupSize, courseNames })));
-        const shown = results.filter((r) => r !== null && !r.hidden);
-        departments = {
-            shown: shown.map(({ groupId, truncated, ...rest }) => rest),
-            hiddenGroups: groupList.items.length - shown.length - (ordered.length - limited.length),
-            notIncluded: ordered.length - limited.length,
+        const result = await departmentStats(client, groupList.items, {
+            period: periodWindow,
+            minGroupSize,
+            courseNames,
+            limit: 25,
+            deadline,
+            warnings,
+        });
+        return {
+            shown: result.shown.map(({ groupId, truncated, ...rest }) => rest),
+            hiddenGroups: result.hiddenGroups,
+            notIncluded: result.notIncluded,
         };
-    }
+    };
+    const [hotspots, departments] = await Promise.all([computeHotspots(), computeDepartments()]);
     // --- Engagement, upcoming, admin to-dos ---
     const engagement = usersPeriod || activity
         ? {
@@ -851,8 +890,6 @@ async function monthlyReport(ctx, args) {
             activeUsers: activity?.data?.activityCount ?? activity?.rows?.[0]?.activityCount ?? null,
         }
         : null;
-    const upcoming = await safe("schedules", warnings, () => upcomingSchedules(client, 31));
-    const todos = await adminTodoCounts(client, warnings);
     const certificatesThisMonth = certTotalsPeriod?.rows?.[0]
         ? num(certTotalsPeriod.rows[0].amountIssued)
         : sum((c) => c.thisMonth.certificatesIssued);

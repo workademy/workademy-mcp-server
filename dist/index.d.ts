@@ -30,6 +30,7 @@ export declare class WorkademyClient implements ApiClient {
     request<T = any>(method: Method, path: string, options?: {
         params?: Record<string, any>;
         data?: any;
+        timeoutMs?: number;
     }): Promise<T>;
     /** Downloads a pre-signed export file (no auth header). */
     download(url: string): Promise<string>;

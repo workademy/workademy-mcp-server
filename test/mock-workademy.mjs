@@ -47,6 +47,7 @@ export async function startMock({
   host = "127.0.0.1",
   users = {}, // e-mail -> password, for the password grant
   userWorkspaces = null, // what GET /workspaces returns for a logged-in user
+  slowUngradedMs = 0, // simulate the slow ungraded-answers count of large workspaces
 }) {
   const now = Date.now();
   const state = {
@@ -71,8 +72,8 @@ export async function startMock({
     103: [],
   };
   const groups = [
-    { id: 1, name: "Sales", userCount: 12, source: "PERSONIO", workspaceId },
-    { id: 2, name: "Legal", userCount: 3, source: "WORKADEMY", workspaceId },
+    { id: 1, name: "Sales", userCount: 0, source: "PERSONIO", workspaceId }, // the list never fills userCount
+    { id: 2, name: "Legal", userCount: 0, source: "WORKADEMY", workspaceId },
   ];
   const byGroup = {
     1: [
@@ -172,6 +173,8 @@ export async function startMock({
     if (method === "GET" && path === "/api/v1/secured/groups") return page(groups, query);
     if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/groups\/(\d+)$/)))
       return groups.find((g) => String(g.id) === m[1]);
+    if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/groups\/(\d+)\/users$/)))
+      return page(Array.from({ length: { 1: 12, 2: 3 }[m[1]] ?? 0 }, (_, i) => ({ id: i })), query);
     if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/groups\/(\d+)\/usercourses$/)))
       return page(byGroup[m[1]] ?? [], query);
     if (method === "GET" && path === "/api/v1/secured/learningpaths") return page([{ id: 1 }, { id: 2 }], query);
@@ -258,6 +261,9 @@ export async function startMock({
       }
       let parsedBody = null;
       try { parsedBody = body ? JSON.parse(body) : null; } catch { parsedBody = null; }
+      if (path === "/api/v1/secured/ucqas/_ungraded-open-ended-answers" && slowUngradedMs) {
+        return setTimeout(() => send(200, { content: [], totalElements: 4 }), slowUngradedMs);
+      }
       const result = coreRoute(req.method, path, url.searchParams, state.userTokens.has(token), parsedBody);
       if (result === undefined) return send(404, { message: `mock: no route for ${req.method} ${path}` });
       if (result && result.__status) return send(result.__status, { message: result.message });

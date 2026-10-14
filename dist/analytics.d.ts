@@ -9,6 +9,7 @@ export interface ApiClient {
     request<T = any>(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, options?: {
         params?: Record<string, any>;
         data?: any;
+        timeoutMs?: number;
     }): Promise<T>;
     /** Downloads a pre-signed export URL (no auth header). */
     download(url: string): Promise<string>;
