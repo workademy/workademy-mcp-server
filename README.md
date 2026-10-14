@@ -173,7 +173,7 @@ workspace `default`. Set `WORKADEMY_READ_ONLY=true` to protect it as well.
 **OAuth client.** API-key logins use the built-in OAuth client. If it ever changes, set `WORKADEMY_OAUTH_CLIENT_ID`
 and `WORKADEMY_OAUTH_CLIENT_SECRET` (or a base64 `WORKADEMY_OAUTH_CLIENT_BASIC`).
 
-Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSVs, default: the system temp folder).
+Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSVs, default: the system temp folder), `WORKADEMY_REPORTS_DIR` (where the client PDFs go, default: `reports/` in the project folder) and `WORKADEMY_CHROME_PATH` (the browser that prints them, if Chrome is not in its usual place).
 
 ## Analytics and reporting tools
 
@@ -186,7 +186,9 @@ Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSV
 | `get_group_course_stats` | Completion per department (group) and course; small groups and cells hidden |
 | `export_report` | Runs a CSV export (workspace, course, group, user, learning path), waits, downloads it and returns the path. The file has named data |
 | `get_admin_todos` | Pending enrollment approvals, ungraded open answers, scheduled runs coming up |
-| `get_monthly_report` | Aggregate-only monthly report for a client one-pager: headline numbers, per-course enrollments and completions, certificates, logins, most-missed questions, departments, upcoming runs, admin to-dos |
+| `get_monthly_report` | Aggregate-only monthly report for a client one-pager: headline numbers, per-course enrollments and completions, the month's busiest courses, the previous month's totals, certificates, logins, most-missed questions, departments, upcoming runs, admin to-dos |
+| `get_workspace_branding` | The workspace's logos, theme colours and company name from its `profile.json` |
+| `create_monthly_report_pdf` | The client one-pager as a one-page A4 PDF (see below), saved in `reports/<month>/`; says whether the month is worth sending |
 
 **Privacy.** The report and stats tools return counts only — no names, e-mails or user ids. Departments with fewer
 than `minGroupSize` members (default 5), department/course cells below that size and questions with fewer answers
@@ -197,11 +199,52 @@ The analytics service (`/analytics-api/…`) is not in the public Swagger; the p
 calls. If a workspace's key cannot reach it, `get_monthly_report` falls back to computing enrollments from the
 core API and says so in `warnings`.
 
+### Monthly client reports (PDF)
+
+Each client gets a one-page A4 PDF they can forward to their management: the month's numbers, the courses
+people went to, the quiz questions most people got wrong ("Where to look"), in Workademy's brand with the client's
+logo. It is made from `get_monthly_report`, so it holds counts only.
+
+```bash
+npm run reports                          # last month, every workspace in workspaces.json
+npm run reports -- --month 2026-09       # a given month
+npm run reports -- --only edera,clark    # some workspaces
+npm run reports -- --all                 # also PDFs for quiet months
+```
+
+The PDFs land in `reports/<month>/<Client>_Workademy_report_<month>.pdf` (git-ignored), with the numbers each one
+was made from (`<workspace>.report.json`, counts only) and `summary.md`:
+who gets the report, who gets the win-back email instead (fewer than 5 completions in the month), and what failed.
+From Claude, `create_monthly_report_pdf` makes one client's PDF.
+
+Settings per workspace go in a `report` block in `workspaces.json` (all optional):
+
+```json
+"edera":   { "...": "...", "report": { "client": "EdEra", "language": "uk" } },
+"clark":   { "...": "...", "report": { "language": "de", "logo": "https://…/clark-logo.svg", "minCompletions": 10 } },
+"demo":    { "...": "...", "report": { "skip": true } }
+```
+
+| Setting | Default |
+|---|---|
+| `client` | the workspace name; used on the page and in the file name |
+| `language` | `en`, `de` or `uk`; default from the workspace's locale, else `en` |
+| `logo` | URL or file (relative to this folder); default: the workspace's own logo (white logos are skipped) |
+| `headline` | the lead sentence is picked from the data (one course with 40%+ of enrolments, growth on last month, or the busiest course); set this for a hand-written one |
+| `minCompletions` | 5: completions needed for the month to be worth a report |
+| `skip` | leave the workspace out of `npm run reports` (internal or demo workspaces) |
+
+How it works: the page is printed by the Chrome on this computer (through `playwright-core`; no browser download).
+Fonts (Staatliches, Oswald for Cyrillic, Roboto; SIL Open Font License) and the Workademy logo are in `assets/`.
+Before printing, the page is measured; if it is too long it gets more compact step by step (tighter spacing,
+fewer table rows), and the finished PDF is checked to be exactly one page.
+
 ### Testing
 
 `npm run build && npm run test:smoke` starts two mock workspaces and drives the built server over MCP:
 routing, read-only protection, token refresh, analytics paths, the monthly report (with and without
-analytics access), exports, the legacy single-key setup and `npm run keys`.
+analytics access), exports, the legacy single-key setup, `npm run keys`, the one-pager's wording and, when
+Chrome or Chromium is installed, the PDFs and `npm run reports`.
 
 ## Available Tools
 

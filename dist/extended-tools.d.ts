@@ -24,6 +24,116 @@ export declare function decorateTools<T extends {
     aliases: string[];
 } | null): T[];
 export declare function listConfiguredWorkspaces(registry: WorkspaceRegistry, clientFor: (workspace: WorkspaceConfig) => ApiClient, args: Record<string, any>): Promise<ToolResult>;
+/**
+ * The workspace's branding as the web app loads it: profile.json on the asset CDN
+ * (logos, theme colours, company name). Public files, no API key needed.
+ */
+export declare function workspaceBranding(ctx: ToolContext): Promise<{
+    workspace: string;
+    found: boolean;
+    tried: string[];
+    profileUrl?: undefined;
+    company?: undefined;
+    title?: undefined;
+    companyUrl?: undefined;
+    logos?: undefined;
+    colors?: undefined;
+    note?: undefined;
+} | {
+    workspace: string;
+    found: boolean;
+    profileUrl: string | null;
+    company: any;
+    title: any;
+    companyUrl: any;
+    logos: {
+        logo: string | null;
+        header: string | null;
+        footer: string | null;
+        favicon: string | null;
+    };
+    colors: {
+        primary: any;
+        secondary: any;
+        accent: any;
+    };
+    note: string;
+    tried?: undefined;
+}>;
+export declare function monthlyReport(ctx: ToolContext, args: Record<string, any>): Promise<{
+    workspace: {
+        alias: string;
+        id: number;
+        name: any;
+        hostname: any;
+        createdAt: string | null;
+        locale: any;
+    };
+    period: {
+        month: string;
+        start: string | null;
+        end: string | null;
+        timezone: string;
+    };
+    privacy: string;
+    sources: Record<string, string>;
+    headline: {
+        learners: number | null;
+        courses: number | null;
+        coursesWithActivity: number;
+        enrollmentsToDate: number;
+        completionsToDate: number;
+        completionRateToDate: number | null;
+        openToDate: number;
+        newEnrollmentsThisMonth: number;
+        completionsThisMonth: number;
+        certificatesThisMonth: number | null;
+        avgCertificateScoreThisMonth: number | null;
+        logins: number | null;
+        activeUsers: any;
+    };
+    previousMonth: {
+        month: string;
+        newEnrollments: number;
+        completions: number;
+    } | null;
+    topCoursesThisMonth: {
+        courseId: number;
+        course: string;
+        enrolled: number;
+        finished: number;
+        certificatesIssued: number | null;
+        avgCertificateScorePercent: number | null;
+        completionRateToDate: number | null;
+    }[];
+    coursesActiveThisMonth: number;
+    courses: {
+        courseId: number;
+        course: string;
+        toDate: Record<string, number | null>;
+        thisMonth: Record<string, number | null>;
+    }[];
+    coursesOmitted: number;
+    struggleHotspots: Record<string, any> | null;
+    departments: Record<string, any> | null;
+    engagement: {
+        logins: number | null;
+        registrations: number | null;
+        activeUsers: any;
+    } | null;
+    upcomingScheduledRuns: {
+        item: string | null;
+        type: any;
+        nextRun: string | null;
+        repeats: any;
+    }[] | null;
+    adminTodos: {
+        note: string;
+        pendingEnrollmentApprovals: number | null;
+        ungradedOpenAnswers: number | null;
+    };
+    warnings: string[];
+}>;
 export declare const EXTENDED_TOOLS: ({
     name: string;
     description: string;
@@ -64,6 +174,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required?: undefined;
     };
@@ -104,6 +218,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required?: undefined;
     };
@@ -186,6 +304,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required: string[];
     };
@@ -238,6 +360,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required?: undefined;
     };
@@ -296,6 +422,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required?: undefined;
     };
@@ -372,6 +502,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required: string[];
     };
@@ -421,6 +555,10 @@ export declare const EXTENDED_TOOLS: ({
             daysAhead?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required: string[];
     };
@@ -464,6 +602,10 @@ export declare const EXTENDED_TOOLS: ({
             groupBy?: undefined;
             topQuestions?: undefined;
             includeDepartments?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
         };
         required?: undefined;
     };
@@ -516,6 +658,70 @@ export declare const EXTENDED_TOOLS: ({
             filePath?: undefined;
             groupBy?: undefined;
             daysAhead?: undefined;
+            language?: undefined;
+            client?: undefined;
+            headline?: undefined;
+            logo?: undefined;
+        };
+        required?: undefined;
+    };
+} | {
+    name: string;
+    description: string;
+    inputSchema: {
+        type: string;
+        properties: {
+            month: {
+                type: string;
+                description: string;
+            };
+            language: {
+                type: string;
+                enum: string[];
+                description: string;
+            };
+            client: {
+                type: string;
+                description: string;
+            };
+            headline: {
+                type: string;
+                description: string;
+            };
+            logo: {
+                type: string;
+                description: string;
+            };
+            verify?: undefined;
+            fact?: undefined;
+            courseId?: undefined;
+            moduleId?: undefined;
+            lectureId?: undefined;
+            breakdown?: undefined;
+            start?: undefined;
+            end?: undefined;
+            aggregationType?: undefined;
+            timeseries?: undefined;
+            page?: undefined;
+            size?: undefined;
+            sort?: undefined;
+            sortDir?: undefined;
+            maxCourses?: undefined;
+            groupId?: undefined;
+            minGroupSize?: undefined;
+            maxGroups?: undefined;
+            scope?: undefined;
+            userId?: undefined;
+            learningPathId?: undefined;
+            type?: undefined;
+            periodFilter?: undefined;
+            timezone?: undefined;
+            q?: undefined;
+            filePath?: undefined;
+            groupBy?: undefined;
+            daysAhead?: undefined;
+            topQuestions?: undefined;
+            includeDepartments?: undefined;
         };
         required?: undefined;
     };

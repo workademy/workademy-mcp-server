@@ -789,7 +789,7 @@ export class WorkademyClient implements ApiClient {
 const server = new Server(
   {
     name: "workademy-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   },
   {
     capabilities: {
@@ -2006,7 +2006,10 @@ async function main() {
   console.error("Workademy MCP Server running on stdio");
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+// `npm run reports` loads the API client from this file without starting the MCP server
+if (process.env.WORKADEMY_MCP_NO_SERVER !== "1") {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+  });
+}

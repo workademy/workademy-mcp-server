@@ -935,7 +935,7 @@ async function summarizeExport(_ctx: ToolContext, args: Record<string, any>) {
  * The workspace's branding as the web app loads it: profile.json on the asset CDN
  * (logos, theme colours, company name). Public files, no API key needed.
  */
-async function workspaceBranding(ctx: ToolContext) {
+export async function workspaceBranding(ctx: ToolContext) {
   const { client } = ctx;
   const cdn = (process.env.WORKADEMY_ASSET_CDN || "https://d18lcb7860whbu.cloudfront.net").replace(/\/+$/, "");
   const workspaceId = await client.getWorkspaceId();
@@ -988,9 +988,16 @@ async function adminTodos(ctx: ToolContext, args: Record<string, any>) {
   return { workspace: ctx.workspace.alias, ...counts, upcomingScheduledRuns: upcoming, warnings };
 }
 
-async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
+/** The month before `label` (YYYY-MM). */
+function previousMonthLabel(label: string): string {
+  const [year, month] = label.split("-").map(Number);
+  return month === 1 ? `${year - 1}-12` : `${year}-${String(month - 1).padStart(2, "0")}`;
+}
+
+export async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
   const { client } = ctx;
   const period = monthRange(args.month);
+  const previous = monthRange(previousMonthLabel(period.label));
   const minGroupSize = clampInt(args.minGroupSize, 5, 1, 100);
   const topQuestions = clampInt(args.topQuestions, 3, 1, 20);
   const includeDepartments = args.includeDepartments !== false;
@@ -999,7 +1006,8 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
 
   // Large workspaces can be slow: the report has a time budget so it always answers
   // (the device bridge gives a tool 60 s). Sections that run out of time say so in warnings.
-  const deadline = Date.now() + Number(process.env.WORKADEMY_REPORT_BUDGET_MS ?? 40_000);
+  // (args.budgetMs is for internal callers such as the PDF tool and the monthly run, not in the schema)
+  const deadline = Date.now() + Number(args.budgetMs ?? process.env.WORKADEMY_REPORT_BUDGET_MS ?? 40_000);
   const timeLeft = () => Date.now() < deadline;
   const workspaceId = await client.getWorkspaceId();
   const courseNames = new Map<number, string>();
@@ -1049,6 +1057,7 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
     activity,
     upcoming,
     todos,
+    totalsPrevious,
   ] = await Promise.all([
     safe("workspace", warnings, () => client.request<any>("GET", `/api/v1/secured/workspaces/${workspaceId}`)),
     safe("course count", warnings, () => countOf(client, "/api/v1/secured/courses")),
@@ -1064,6 +1073,13 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
     facts("activity", { fact: "activity", ...periodWindow, ...month }),
     safe("schedules", warnings, () => upcomingSchedules(client, 31)),
     adminTodoCounts(client, warnings),
+    facts("totals previous month", {
+      fact: "usercourse",
+      breakdown: "none",
+      start: previous.start,
+      end: previous.end,
+      ...month,
+    }),
   ]);
 
   // --- Courses ---
@@ -1170,6 +1186,7 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
         const rec = byId.get(row.courseId);
         if (!rec) continue;
         row.course = rec.name || row.course;
+        courseNames.set(row.courseId, row.course);
         row.toDate = {
           enrolled: rec.enrolled,
           finished: rec.finished,
@@ -1215,6 +1232,68 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
   const abandonedToDate = recordsToDate ? 0 : totalToDate ? num(totalToDate.amountAbandoned) : sum((c) => c.toDate.abandoned);
   const enrolledThisMonth = totalPeriod ? num(totalPeriod.amountStarted) : sum((c) => c.thisMonth.enrolled);
   const finishedThisMonth = totalPeriod ? num(totalPeriod.amountEnded) : sum((c) => c.thisMonth.finished);
+
+  // --- The month's busiest courses (the one-pager's table) ---
+  // `courses` is ordered by all-time size; the page wants this month's activity.
+  type MonthCourse = {
+    courseId: number;
+    course: string;
+    enrolled: number;
+    finished: number;
+    certificatesIssued: number | null;
+    avgCertificateScorePercent: number | null;
+    completionRateToDate: number | null;
+  };
+  const toDateById = new Map(courses.map((c) => [c.courseId, c]));
+  let monthRows: MonthCourse[];
+  let coursesActiveThisMonth: number;
+  if (enrollPeriod?.rows) {
+    const certsByCourse = new Map((certsPeriod?.rows ?? []).map((r) => [r.courseId, r]));
+    const active = enrollPeriod.rows.filter((r) => num(r.amountStarted) > 0 || num(r.amountEnded) > 0);
+    coursesActiveThisMonth = Math.max(num(enrollPeriod.page?.totalElements), active.length);
+    monthRows = active.map((r) => ({
+      courseId: r.courseId,
+      course: courseNames.get(r.courseId) ?? r.courseName ?? String(r.courseId),
+      enrolled: num(r.amountStarted),
+      finished: num(r.amountEnded),
+      certificatesIssued: certsByCourse.has(r.courseId) ? num(certsByCourse.get(r.courseId)!.amountIssued) : null,
+      avgCertificateScorePercent: scorePercent(certsByCourse.get(r.courseId)?.avgScore),
+      completionRateToDate: null,
+    }));
+  } else {
+    const active = courses.filter((c) => num(c.thisMonth.enrolled) > 0 || num(c.thisMonth.finished) > 0);
+    coursesActiveThisMonth = active.length;
+    monthRows = active.map((c) => ({
+      courseId: c.courseId,
+      course: c.course,
+      enrolled: num(c.thisMonth.enrolled),
+      finished: num(c.thisMonth.finished),
+      certificatesIssued: null,
+      avgCertificateScorePercent: null,
+      completionRateToDate: null,
+    }));
+  }
+  monthRows.sort((a, b) => b.enrolled - a.enrolled || b.finished - a.finished);
+  const topCoursesThisMonth = monthRows.slice(0, 10);
+  for (const row of topCoursesThisMonth) {
+    // all-time completion only where the to-date numbers are complete (records, or the core API path)
+    if (sources.toDate || sources.enrollments !== "analytics API") {
+      row.completionRateToDate = (toDateById.get(row.courseId)?.toDate.completionRate as number | null) ?? null;
+    }
+  }
+  // Analytics shortens course names; large workspaces did not get the real names from the records
+  if (!sources.toDate && sources.enrollments === "analytics API" && timeLeft()) {
+    await mapLimit(topCoursesThisMonth, 5, async (row) => {
+      const course = await safe(`course ${row.courseId} name`, warnings, () =>
+        client.request<any>("GET", `/api/v1/secured/courses/${row.courseId}`)
+      );
+      const name = stripHtml(course?.name ?? "");
+      if (name) {
+        row.course = name;
+        courseNames.set(row.courseId, name);
+      }
+    });
+  }
 
   // --- Where people struggle: drill course -> module -> lecture -> question on wrong answers ---
   const computeHotspots = async (): Promise<Record<string, any> | null> => {
@@ -1318,12 +1397,16 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
   const certificatesThisMonth = certTotalsPeriod?.rows?.[0]
     ? num(certTotalsPeriod.rows[0].amountIssued)
     : sum((c) => c.thisMonth.certificatesIssued);
+  const analyticsNumbers = sources.enrollments === "analytics API";
+  const previousTotals = totalsPrevious?.rows?.[0];
   return {
     workspace: {
       alias: ctx.workspace.alias,
       id: workspaceId,
       name: info?.name ?? ctx.workspace.name ?? null,
       hostname: info?.hostname ?? null,
+      createdAt: iso(typeof info?.createTime === "number" ? info.createTime : null),
+      locale: info?.locale ?? null,
     },
     period: { month: period.label, start: iso(period.start), end: iso(period.end), timezone: "UTC" },
     privacy:
@@ -1341,10 +1424,21 @@ async function monthlyReport(ctx: ToolContext, args: Record<string, any>) {
       openToDate: Math.max(enrolledToDate - finishedToDate - abandonedToDate, 0),
       newEnrollmentsThisMonth: enrolledThisMonth,
       completionsThisMonth: finishedThisMonth,
-      certificatesThisMonth: sources.enrollments === "analytics API" ? certificatesThisMonth : null,
+      certificatesThisMonth: analyticsNumbers ? certificatesThisMonth : null,
+      avgCertificateScoreThisMonth: analyticsNumbers ? scorePercent(certTotalsPeriod?.rows?.[0]?.avgScore) : null,
       logins: engagement?.logins ?? null,
       activeUsers: engagement?.activeUsers ?? null,
     },
+    previousMonth:
+      analyticsNumbers && previousTotals
+        ? {
+            month: previous.label,
+            newEnrollments: num(previousTotals.amountStarted),
+            completions: num(previousTotals.amountEnded),
+          }
+        : null,
+    topCoursesThisMonth,
+    coursesActiveThisMonth,
     courses: courses.slice(0, 25),
     coursesOmitted: Math.max(num(coursesWithActivity) - Math.min(courses.length, 25), 0),
     struggleHotspots: hotspots,
@@ -1513,6 +1607,21 @@ export const EXTENDED_TOOLS = [
       },
     },
   },
+  {
+    name: "create_monthly_report_pdf",
+    description:
+      "Make the client's monthly one-pager as a PDF (one A4 page, Workademy brand with the client's logo) from get_monthly_report, and save it in the reports folder. Returns the file path, the lead sentence used, whether the page fit, and whether the month is worth sending (completions threshold) or should get the win-back email instead. Needs Google Chrome on this computer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Month as YYYY-MM (UTC). Default: the previous full month" },
+        language: { type: "string", enum: ["en", "de", "uk"], description: "Page language (default: the workspace's report setting, else its locale, else en)" },
+        client: { type: "string", description: "Client name on the page and in the file name (default: the workspace name)" },
+        headline: { type: "string", description: "Own lead sentence instead of the automatic one" },
+        logo: { type: "string", description: "Logo URL or file path instead of the workspace's own logo" },
+      },
+    },
+  },
 ];
 
 const HANDLERS: Record<string, (ctx: ToolContext, args: Record<string, any>) => Promise<unknown>> = {
@@ -1525,6 +1634,8 @@ const HANDLERS: Record<string, (ctx: ToolContext, args: Record<string, any>) => 
   get_workspace_branding: (ctx) => workspaceBranding(ctx),
   get_admin_todos: adminTodos,
   get_monthly_report: monthlyReport,
+  // loaded on first use: it brings the PDF renderer (and playwright-core) with it
+  create_monthly_report_pdf: async (ctx, args) => (await import("./monthly-pdf.js")).createMonthlyPdf(ctx, args),
 };
 
 /** Returns null when the tool is not one of the extended tools. */

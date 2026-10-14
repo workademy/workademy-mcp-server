@@ -94,6 +94,7 @@ export class WorkspaceRegistry {
                 // Safe default: workspaces from the file are read-only unless stated otherwise.
                 readOnly: entry.readOnly ?? true,
                 source: "file",
+                ...(entry.report ? { report: entry.report } : {}),
             };
         });
         const defaultAlias = parsed.default ?? workspaces[0].alias;

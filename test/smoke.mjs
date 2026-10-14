@@ -31,7 +31,13 @@ const baseEnv = {
   WORKADEMY_TODO_TIMEOUT_MS: "500",
   WORKADEMY_ASSET_CDN: "", // set per run below
   WORKADEMY_EXPORT_DIR: tmp,
+  WORKADEMY_REPORTS_DIR: path.join(tmp, "reports"),
+  // so the PDF checks find the browser on machines where Chrome is not in a standard place
+  ...(process.env.WORKADEMY_CHROME_PATH ? { WORKADEMY_CHROME_PATH: process.env.WORKADEMY_CHROME_PATH } : {}),
+  ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH } : {}),
 };
+const pdfLib = await import("../dist/report-pdf.js");
+const chrome = pdfLib.findChrome();
 
 async function connect(env) {
   const transport = new StdioClientTransport({
@@ -246,6 +252,77 @@ await check("monthly report (analytics): aggregates, hotspots, small groups hidd
   assert.ok(!text.includes("@client.example"), "leaked an e-mail");
 });
 
+await check("monthly report: this month's busiest courses, previous month, workspace start", async () => {
+  const r = await call(mcp, "get_monthly_report", { includeDepartments: false });
+  assert.deepEqual(
+    r.topCoursesThisMonth.map((c) => [c.course, c.enrolled, c.finished, c.completionRateToDate]),
+    [["Safety instruction", 20, 5, 25], ["Data protection refresher", 12, 9, 80]],
+    "ordered by this month's enrolments, all-time completion from the records"
+  );
+  assert.equal(r.topCoursesThisMonth[1].avgCertificateScorePercent, 88.5);
+  assert.equal(r.coursesActiveThisMonth, 2);
+  assert.deepEqual([r.previousMonth.newEnrollments, r.previousMonth.completions], [32, 14]);
+  assert.equal(r.headline.avgCertificateScoreThisMonth, 88.5);
+  assert.equal(r.workspace.locale, "de_DE");
+  assert.ok(Date.parse(r.workspace.createdAt) < Date.now() - 300 * 864e5);
+});
+
+await check("one-pager wording: numbers, plurals, questions, file names, lead sentence", async () => {
+  const { formatNumber, formatPercent, ukPlural, questionText, shortCourseName, languageFor, pdfFileName, buildPageModel } = pdfLib;
+  assert.deepEqual([formatNumber(23910, "en"), formatNumber(23910, "de"), formatNumber(23910, "uk")], ["23,910", "23.910", "23 910"]);
+  assert.deepEqual([formatPercent(15.8, "de", 1), formatPercent(11, "en", 1, true), formatPercent(85, "uk")], ["15,8 %", "11.0%", "85%"]);
+  assert.deepEqual([1, 3, 11, 21, 180].map((n) => ukPlural(n, "курс", "курси", "курсів")), ["курс", "курси", "курсів", "курс", "курсів"]);
+  assert.equal(questionText("48213"), null, "an id is not a question");
+  assert.equal(questionText("<p>Within how many hours must a breach be reported?</p>"), "Within how many hours must a breach be reported?");
+  assert.equal(questionText("It makes sense to borrow competitors keywords when"), "It makes sense to borrow competitors keywords when…", "cut text marked");
+  assert.equal(questionText('It makes sense to "borrow" competitors\' keywords...'), 'It makes sense to "borrow" competitors\' keywords…');
+  assert.equal(shortCourseName("Старша профільна школа: базове навчання для педагогічних працівників"), "Старша профільна школа");
+  assert.deepEqual([languageFor(undefined, "uk_UA"), languageFor({ language: "en" }, "de_DE"), languageFor(undefined, "fr_FR")], ["uk", "en", "en"]);
+  assert.equal(pdfFileName("SE Ranking", "2026-09", "x"), "SE-Ranking_Workademy_report_2026-09.pdf");
+  assert.equal(pdfFileName("Café Rynok", "2026-09", "x"), "Cafe-Rynok_Workademy_report_2026-09.pdf");
+  assert.equal(pdfFileName("ЕдЕра", "2026-09", "edera"), "edera_Workademy_report_2026-09.pdf", "Latin file names only");
+
+  const base = (over) => ({
+    period: { month: "2026-09", end: "2026-09-30T23:59:59.999Z" },
+    sources: { enrollments: "analytics API" },
+    headline: { newEnrollmentsThisMonth: 100, completionsThisMonth: 40, certificatesThisMonth: 30, avgCertificateScoreThisMonth: 91, activeUsers: 80 },
+    topCoursesThisMonth: [{ course: "Onboarding: first week", enrolled: 30, finished: 20 }, { course: "Safety", enrolled: 25, finished: 10 }],
+    coursesActiveThisMonth: 6,
+    ...over,
+  });
+  const kind = (report, language = "en") => buildPageModel(report, { language, client: "X" });
+  assert.equal(kind(base({ topCoursesThisMonth: [{ course: "Onboarding: first week", enrolled: 60, finished: 5 }] })).headlineKind, "share");
+  assert.match(kind(base({ topCoursesThisMonth: [{ course: "Onboarding: first week", enrolled: 60, finished: 5 }] }), "uk").headline, /^Понад половина вересневих записів \(60%\) — на курс «Onboarding»\.$/);
+  assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 90, completions: 20 } })).headlineKind, "finished_up");
+  assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 90, completions: 20 } })).headline, "40 courses finished in September, 100% more than in August.");
+  assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 50, completions: 40 } })).headlineKind, "enrolled_up");
+  assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 150, completions: 60 } })).headlineKind, "busiest", "no bad news in the lead");
+  assert.equal(kind(base({ headline: { newEnrollmentsThisMonth: 0, completionsThisMonth: 0 }, topCoursesThisMonth: [] })).headlineKind, "quiet");
+  assert.equal(buildPageModel(base({}), { language: "de", client: "X", headline: "Eigener Satz." }).headline, "Eigener Satz.");
+  const model = kind(base({}));
+  assert.deepEqual(model.kpis.map((k) => k.label), ["new enrolments", "courses finished", "certificates, avg. score 91%", "active learners"]);
+  assert.equal(model.table.lastColumn, null, "no completion or score column without the data");
+  const html = pdfLib.buildHtml({ ...model, client: "<script>x</script>" }, { fontCss: "", workademyLogo: "", clientLogo: null });
+  assert.ok(!html.includes("<script>x"), "names are escaped");
+  assert.match(html, /6 more courses|4 more courses/);
+});
+
+await check("create_monthly_report_pdf: one A4 page in the workspace's language", async () => {
+  if (!chrome) return console.log("       (no Chrome or Chromium on this machine: PDF checks skipped)");
+  const r = await call(mcp, "create_monthly_report_pdf", {});
+  assert.equal(r.language, "de", "the mock workspace's locale is de_DE");
+  assert.deepEqual([r.pages, r.fitsOnePage], [1, true]);
+  assert.equal(fs.readFileSync(r.pdfPath).subarray(0, 5).toString(), "%PDF-");
+  assert.ok(r.pdfPath.startsWith(path.join(tmp, "reports")), "saved in WORKADEMY_REPORTS_DIR");
+  assert.match(path.basename(r.pdfPath), /^EdEra_Workademy_report_\d{4}-\d{2}\.pdf$/);
+  assert.equal(r.headlineKind, "share");
+  assert.match(r.headline, /^Mehr als die Hälfte der Einschreibungen im \S+ \(63 %\) entfiel auf einen Kurs: „Safety instruction“\.$/);
+  assert.deepEqual(r.sendRecommendation, { send: true, reason: "14 completions (threshold 5)" });
+  assert.ok(r.warnings.some((w) => w.startsWith("No usable client logo")), "unreachable logos fall back to the name");
+  const uk = await call(mcp, "create_monthly_report_pdf", { language: "uk", headline: "Свій перший рядок." });
+  assert.deepEqual([uk.language, uk.headlineKind, uk.pages], ["uk", "custom", 1]);
+});
+
 await check("monthly report without analytics access falls back to the core API", async () => {
   const started = Date.now();
   const r = await call(mcp, "get_monthly_report", { workspace: "client", month: thisMonth });
@@ -373,6 +450,56 @@ await check("wrong password: clear message, password not echoed", async () => {
   }
   assert.match(output, /login at .* failed \(400\): Bad credentials/);
   assert.ok(!output.includes("wrong-pass"));
+});
+
+console.log("monthly run (npm run reports)");
+await check("makes the PDFs, sends quiet accounts to win-back, reports failures, skips internal workspaces", async () => {
+  if (!chrome) return console.log("       (no Chrome or Chromium on this machine: skipped)");
+  const runDir = path.join(tmp, "run");
+  fs.mkdirSync(runDir);
+  const file = path.join(runDir, "workspaces.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      workspaces: {
+        edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", report: { client: "EdEra", language: "uk", logo: "assets/workademy-logo.png" } },
+        client: { name: "Client", baseUrl: b.url, apiKeyEnv: "KEY_CLIENT", report: { minCompletions: 100000 } },
+        demo: { name: "Demo", hostname: "demo.example", report: { skip: true } },
+        missing: { hostname: "missing.example", apiKeyEnv: "KEY_NOT_SET" },
+      },
+    })
+  );
+  const out = path.join(runDir, "out");
+  let stdout = "";
+  try {
+    ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", out], {
+      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", KEY_CLIENT: "key-b", WORKADEMY_ASSET_CDN: a.url },
+      encoding: "utf8",
+    }));
+    assert.fail("a workspace without a key should make the run exit with an error code");
+  } catch (error) {
+    if (error.code === "ERR_ASSERTION") throw error;
+    stdout = error.stdout ?? "";
+  }
+  const summary = JSON.parse(fs.readFileSync(path.join(out, "2026-09", "summary.json"), "utf8"));
+  assert.deepEqual(
+    summary.rows.map((r) => [r.workspace, r.kind]),
+    [["edera", "report"], ["client", "winback"], ["demo", "skipped"], ["missing", "error"]],
+    stdout
+  );
+  const edera = summary.rows[0].result;
+  assert.deepEqual([edera.language, edera.pages, path.basename(edera.pdfPath)], ["uk", 1, "EdEra_Workademy_report_2026-09.pdf"]);
+  assert.ok(fs.existsSync(edera.pdfPath));
+  assert.ok(!edera.warnings.some((w) => w.startsWith("No usable client logo")), "logo file from workspaces.json used");
+  const md = fs.readFileSync(path.join(out, "2026-09", "summary.md"), "utf8");
+  assert.match(md, /## Win-back email instead \(1\)[\s\S]*\*\*Client\*\* \(client\): \d+ completions, below the threshold of 100000/);
+  assert.match(md, /## Failed \(1\)\n\n- missing: no API key/);
+  assert.ok(!fs.existsSync(path.join(out, "2026-09", "Client_Workademy_report_2026-09.pdf")), "no PDF for a win-back account");
+  for (const alias of ["edera", "client"]) {
+    const data = JSON.parse(fs.readFileSync(path.join(out, "2026-09", `${alias}.report.json`), "utf8"));
+    assert.equal(data.period.month, "2026-09", "the numbers behind each decision are kept");
+    for (const name of LEARNER_NAMES) assert.ok(!JSON.stringify(data).includes(name), `leaked ${name}`);
+  }
 });
 
 await a.close();
