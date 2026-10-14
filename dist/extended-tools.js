@@ -5,6 +5,7 @@ import axios from "axios";
 import Papa from "papaparse";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { AGGREGATION_TYPES, FACT_TYPES, fetchFacts, stripHtml, } from "./analytics.js";
+import { isRateLimited } from "./pacing.js";
 const json = (value) => ({
     content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
 });
@@ -163,6 +164,9 @@ function statusOf(error) {
 function messageOf(error) {
     if (axios.isAxiosError(error) && error.code === "ECONNABORTED") {
         return "timed out";
+    }
+    if (isRateLimited(error)) {
+        return `${statusOf(error)} blocked by Workademy's firewall (too many requests); try again in a few minutes`;
     }
     if (axios.isAxiosError(error)) {
         const data = error.response?.data;
@@ -913,6 +917,11 @@ export async function monthlyReport(ctx, args) {
         }
         catch (error) {
             const status = statusOf(error);
+            if (isRateLimited(error)) {
+                // a firewall block, not "this workspace has no analytics": do not switch to other numbers
+                warnings.push(`analytics ${label}: ${messageOf(error)}`);
+                return null;
+            }
             if (status === 401 || status === 403 || status === 404) {
                 if (analyticsAvailable) {
                     warnings.push(`Analytics API not available for this workspace (${messageOf(error)}). ` +

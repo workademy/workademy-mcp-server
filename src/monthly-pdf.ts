@@ -39,20 +39,25 @@ export async function saveReportData(alias: string, report: any): Promise<string
 
 /**
  * A report whose basic calls all failed is not "a quiet month". Returns what went wrong, or null.
- * (Found 15 Oct 2026: keys created a few minutes earlier were refused with 403 on every call.)
+ * (Found 15 Oct 2026: after a burst of requests the firewall answered 403 to every call.)
  */
 export function reportProblem(report: any, alias: string): string | null {
   const h = report?.headline ?? {};
+  const warnings: string[] = report?.warnings ?? [];
+  // a block in the middle of a report leaves numbers that are too low: never use them
+  if (warnings.some((w) => w.includes("firewall"))) {
+    return (
+      "Workademy's firewall limited requests from this computer, so the numbers are incomplete. " +
+      `Wait a few minutes, then run again with --only ${alias}.`
+    );
+  }
   if (h.courses !== null && h.courses !== undefined) return null;
   if (h.learners !== null && h.learners !== undefined) return null;
-  const warnings: string[] = report?.warnings ?? [];
   const refused = warnings.find((w) => /\b(401|403)\b/.test(w));
   if (refused) {
-    const status = /\b(401|403)\b/.exec(refused)![1];
-    return (
-      `Workademy refused access (${status}), so there are no numbers. ` +
-      `A key created in the last few minutes may not work yet: run again later with --only ${alias}.`
-    );
+    return /\b401\b/.test(refused)
+      ? `the API key was not accepted (401). Create a new one with npm run keys (--force), then run again with --only ${alias}.`
+      : `Workademy refused access (403). Check that the key belongs to this workspace, then run again with --only ${alias}.`;
   }
   return `could not read the workspace: ${warnings[0] ?? "no data came back"}`;
 }

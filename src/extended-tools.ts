@@ -13,6 +13,7 @@ import {
   stripHtml,
 } from "./analytics.js";
 import { WorkspaceConfig, WorkspaceRegistry } from "./registry.js";
+import { isRateLimited } from "./pacing.js";
 
 export type { ApiClient } from "./analytics.js";
 
@@ -201,6 +202,9 @@ function statusOf(error: unknown): number | undefined {
 function messageOf(error: unknown): string {
   if (axios.isAxiosError(error) && error.code === "ECONNABORTED") {
     return "timed out";
+  }
+  if (isRateLimited(error)) {
+    return `${statusOf(error)} blocked by Workademy's firewall (too many requests); try again in a few minutes`;
   }
   if (axios.isAxiosError(error)) {
     const data: any = error.response?.data;
@@ -1020,6 +1024,11 @@ export async function monthlyReport(ctx: ToolContext, args: Record<string, any>)
       return await fetchFacts(client, workspaceId, query);
     } catch (error) {
       const status = statusOf(error);
+      if (isRateLimited(error)) {
+        // a firewall block, not "this workspace has no analytics": do not switch to other numbers
+        warnings.push(`analytics ${label}: ${messageOf(error)}`);
+        return null;
+      }
       if (status === 401 || status === 403 || status === 404) {
         if (analyticsAvailable) {
           warnings.push(

@@ -11,6 +11,10 @@ import { monthlyReport } from "./extended-tools.js";
 import { createMonthlyPdf, reportProblem, reportsDir, saveReportData, sendDecision, } from "./monthly-pdf.js";
 import { launchBrowser } from "./report-pdf.js";
 process.env.WORKADEMY_MCP_NO_SERVER = "1";
+// The firewall in front of the API blocks an IP for a few minutes after a burst (see pacing.ts):
+// about 4 requests a second, and wait out a block for up to 10 minutes.
+process.env.WORKADEMY_MIN_REQUEST_GAP_MS ??= "250";
+process.env.WORKADEMY_RATE_LIMIT_WAIT_MS ??= "600000";
 const { WorkademyClient } = await import("./index.js");
 const HELP = `Monthly client reports as PDFs.
 
@@ -94,8 +98,8 @@ async function main() {
                     workspaceId: workspace.id,
                 });
                 const ctx = { client, workspace, registry };
-                // no 60 s bridge limit here, so large workspaces get the time they need
-                const report = await monthlyReport(ctx, { month, includeDepartments: false, budgetMs: 150_000 });
+                // no 60 s bridge limit here: large workspaces and firewall pauses get the time they need
+                const report = await monthlyReport(ctx, { month, includeDepartments: false, budgetMs: 900_000 });
                 // no numbers at all (refused key, workspace gone) is a failure, not a quiet month
                 const problem = reportProblem(report, label);
                 if (problem) {

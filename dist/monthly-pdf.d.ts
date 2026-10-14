@@ -11,7 +11,7 @@ export declare function reportsDir(month: string): string;
 export declare function saveReportData(alias: string, report: any): Promise<string>;
 /**
  * A report whose basic calls all failed is not "a quiet month". Returns what went wrong, or null.
- * (Found 15 Oct 2026: keys created a few minutes earlier were refused with 403 on every call.)
+ * (Found 15 Oct 2026: after a burst of requests the firewall answered 403 to every call.)
  */
 export declare function reportProblem(report: any, alias: string): string | null;
 /**

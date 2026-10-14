@@ -7,6 +7,7 @@ import * as path from 'path';
 import Papa from 'papaparse';
 import os from 'os';
 import { WorkspaceRegistry, oauthClientBasic } from "./registry.js";
+import { isRateLimited, pace, waitOutBlock } from "./pacing.js";
 import { EXTENDED_TOOLS, assertToolAllowed, decorateTools, handleExtendedTool, listConfiguredWorkspaces, } from "./extended-tools.js";
 const claudeTmpDir = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'tmp');
 // Workademy API Client (one instance per workspace)
@@ -23,14 +24,16 @@ export class WorkademyClient {
                 "Content-Type": "application/json",
             },
         });
-        // Always send the current token, also on retried requests
-        this.axiosInstance.interceptors.request.use((request) => {
+        // Always send the current token, also on retried requests; batch runs pace their requests
+        this.axiosInstance.interceptors.request.use(async (request) => {
+            await pace();
             if (this.config.accessToken) {
                 request.headers.set("Authorization", `Bearer ${this.config.accessToken}`);
             }
             return request;
         });
         // On 401: get a fresh token and retry once. A second 401 goes back to the caller.
+        // On a firewall block: wait it out and retry, if this process allows waiting (see pacing.ts).
         this.axiosInstance.interceptors.response.use((response) => response, async (error) => {
             const original = error.config;
             if (error.response?.status === 401 && this.config.apiKey && original && !original._retried) {
@@ -38,6 +41,13 @@ export class WorkademyClient {
                 this.config.accessToken = undefined;
                 await this.authenticate();
                 return this.axiosInstance.request(original);
+            }
+            if (original && isRateLimited(error)) {
+                const wait = await waitOutBlock(original._waited ?? 0);
+                if (wait.ok) {
+                    original._waited = wait.waited;
+                    return this.axiosInstance.request(original);
+                }
             }
             throw error;
         });
@@ -56,12 +66,30 @@ export class WorkademyClient {
                     grant_type: "api_key",
                     api_key: this.config.apiKey,
                 });
-                const response = await axios.post(`${this.config.baseUrl}/oauth/token`, params, {
+                const post = () => axios.post(`${this.config.baseUrl}/oauth/token`, params, {
                     headers: {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Authorization": `Basic ${this.config.clientBasic}`,
                     },
                 });
+                // the token endpoint sits behind the same firewall
+                let waited = 0;
+                let response;
+                for (;;) {
+                    await pace();
+                    try {
+                        response = await post();
+                        break;
+                    }
+                    catch (error) {
+                        if (!isRateLimited(error))
+                            throw error;
+                        const wait = await waitOutBlock(waited);
+                        if (!wait.ok)
+                            throw error;
+                        waited = wait.waited;
+                    }
+                }
                 this.config.accessToken = response.data.access_token;
                 this.tokenExpiresAt = Date.now() + response.data.expires_in * 1000;
             })().finally(() => {

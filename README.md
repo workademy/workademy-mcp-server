@@ -218,9 +218,11 @@ who gets the report, who gets the win-back email instead (fewer than 5 completio
 enrolments in the month), and what failed.
 From Claude, `create_monthly_report_pdf` makes one client's PDF.
 
-A workspace that returns no numbers at all (for example a key Workademy still refuses, which can happen for a few
-minutes right after `npm run keys`) is listed under "Failed" with a ready-to-paste command to run it again; it never
-lands on the win-back list.
+Workademy's API sits behind a firewall that blocks an IP for a few minutes after a burst of requests (a 403 web page
+instead of a JSON error). The run therefore paces itself (about 4 requests a second, `WORKADEMY_MIN_REQUEST_GAP_MS`)
+and waits out a block (up to 10 minutes in total, `WORKADEMY_RATE_LIMIT_WAIT_MS`). A workspace whose numbers are
+missing or incomplete is listed under "Failed" with a ready-to-paste command to run it again; it never lands on the
+win-back list.
 
 Settings per workspace go in a `report` block in `workspaces.json` (all optional):
 

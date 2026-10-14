@@ -59,6 +59,7 @@ export async function startMock({
     tokenRequests: 0,
     always401: new Set(),
     polls: 0,
+    waf: null,
   };
 
   const courses = [
@@ -229,6 +230,19 @@ export async function startMock({
       if (path === "/__control/always401") {
         state.always401.add(url.searchParams.get("path"));
         return send(200, { ok: true });
+      }
+      // like CloudFront's firewall: after `after` more requests, block everything for `ms` with an HTML 403
+      if (path === "/__control/waf") {
+        state.waf = { after: Number(url.searchParams.get("after") ?? 0), ms: Number(url.searchParams.get("ms") ?? 1000), until: 0, blocked: 0 };
+        return send(200, { ok: true });
+      }
+      if (state.waf) {
+        if (state.waf.until === 0 && state.waf.after-- <= 0) state.waf.until = Date.now() + state.waf.ms;
+        if (state.waf.until && Date.now() < state.waf.until) {
+          state.waf.blocked += 1;
+          res.writeHead(403, { "Content-Type": "text/html", "X-Cache": "Error from cloudfront" });
+          return res.end("<html><body><h1>403 ERROR</h1>Request blocked.</body></html>");
+        }
       }
       if (path === `/workspace-assets/${new URL(base).host.replace(/\./g, "_")}/profile.json`) {
         return send(200, {

@@ -489,7 +489,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   let stdout = "";
   try {
     ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", out], {
-      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", KEY_CLIENT: "key-b", KEY_REFUSED: "not-a-key", WORKADEMY_ASSET_CDN: a.url },
+      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", KEY_CLIENT: "key-b", KEY_REFUSED: "not-a-key", WORKADEMY_ASSET_CDN: a.url, WORKADEMY_MIN_REQUEST_GAP_MS: "20" },
       encoding: "utf8",
     }));
     assert.fail("a workspace without a key should make the run exit with an error code");
@@ -509,7 +509,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   assert.ok(!edera.warnings.some((w) => w.startsWith("No usable client logo")), "logo file from workspaces.json used");
   const md = fs.readFileSync(path.join(out, "2026-09", "summary.md"), "utf8");
   assert.match(md, /## Win-back email instead \(1\)[\s\S]*\*\*Client\*\* \(client\): \d+ completions? and \d+ new enrolments?, below the thresholds \(100000 completions or 100000 new enrolments\)/);
-  assert.match(md, /## Failed \(2\)\n\n- refused: Workademy refused access \(401\)[^\n]*--only refused\.\n- missing: no API key/);
+  assert.match(md, /## Failed \(2\)\n\n- refused: the API key was not accepted \(401\)[^\n]*--only refused\.\n- missing: no API key/);
   assert.ok(md.includes("npm run reports -- --month 2026-09 --only refused,missing"), "ready-to-paste rerun command");
   assert.ok(!fs.existsSync(path.join(out, "2026-09", "refused.report.json")), "no data file for a failed workspace");
   assert.ok(!fs.existsSync(path.join(out, "2026-09", "Client_Workademy_report_2026-09.pdf")), "no PDF for a win-back account");
@@ -518,6 +518,35 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
     assert.equal(data.period.month, "2026-09", "the numbers behind each decision are kept");
     for (const name of LEARNER_NAMES) assert.ok(!JSON.stringify(data).includes(name), `leaked ${name}`);
   }
+});
+
+await check("firewall block (403 page): the run waits it out; without waiting it is a failure, never a win-back", async () => {
+  const runDir = path.join(tmp, "waf");
+  fs.mkdirSync(runDir);
+  const file = path.join(runDir, "workspaces.json");
+  // thresholds out of reach, so no PDF (and no browser) is needed: the row is "winback" only if numbers came back
+  fs.writeFileSync(file, JSON.stringify({ workspaces: { edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", report: { minCompletions: 1e6, minEnrollments: 1e6 } } } }));
+  const run = async (env) => {
+    try {
+      await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", path.join(runDir, "out")], {
+        env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", WORKADEMY_ASSET_CDN: a.url, WORKADEMY_MIN_REQUEST_GAP_MS: "0", ...env },
+        encoding: "utf8",
+      });
+    } catch (error) {
+      if (!error.stdout) throw error;
+    }
+    return JSON.parse(fs.readFileSync(path.join(runDir, "out", "2026-09", "summary.json"), "utf8")).rows[0];
+  };
+  await fetch(`${a.url}/__control/waf?after=8&ms=1500`);
+  const waited = await run({ WORKADEMY_RATE_LIMIT_WAIT_MS: "20000", WORKADEMY_RATE_LIMIT_FIRST_WAIT_MS: "400" });
+  assert.ok(a.state.waf.blocked > 0, "the mock firewall did block");
+  assert.equal(waited.kind, "winback", JSON.stringify(waited));
+  await fetch(`${a.url}/__control/waf?after=8&ms=60000`);
+  const failed = await run({ WORKADEMY_RATE_LIMIT_WAIT_MS: "0" });
+  assert.equal(failed.kind, "error");
+  assert.match(failed.error, /^Workademy's firewall limited requests from this computer[^]*--only edera\.$/);
+  assert.ok(!fs.existsSync(path.join(runDir, "out", "2026-09", "edera.report.json")) || JSON.parse(fs.readFileSync(path.join(runDir, "out", "2026-09", "edera.report.json"), "utf8")).warnings.length === 0, "incomplete numbers are not kept as the month's data");
+  await fetch(`${a.url}/__control/waf?after=0&ms=0`); // firewall off again
 });
 
 await a.close();
