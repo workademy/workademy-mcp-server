@@ -42,12 +42,39 @@ function ask(question) {
   return new Promise((resolve) => rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); }));
 }
 
+// Reads a line without echoing it. Uses raw mode directly: readline redraws (and clears)
+// the prompt line, which hid the prompt in real terminals.
 function askHidden(question) {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) return ask(question); // piped input
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-    rl._writeToOutput = () => {}; // do not echo what is typed
     process.stdout.write(question);
-    rl.question("", (answer) => { rl.close(); process.stdout.write("\n"); resolve(answer); });
+    let value = "";
+    const finish = () => {
+      stdin.removeListener("data", onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write("\n");
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n" || ch === "\u0004") {
+          finish();
+          resolve(value);
+          return;
+        }
+        if (ch === "\u0003") {
+          finish();
+          process.exit(130); // Ctrl-C
+        }
+        if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+        else if (ch >= " ") value += ch; // ignore other control characters
+      }
+    };
+    stdin.setRawMode(true);
+    stdin.setEncoding("utf8");
+    stdin.resume();
+    stdin.on("data", onData);
   });
 }
 
