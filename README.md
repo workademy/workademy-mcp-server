@@ -122,6 +122,89 @@ Add this to your Claude Desktop config file:
 }
 ```
 
+## Multiple workspaces
+
+A Workademy API key belongs to exactly one workspace, and the API picks the workspace from the
+hostname you call. To work with several workspaces, list them in a JSON file and point
+`WORKADEMY_WORKSPACES_FILE` at it. Every tool then takes an optional `workspace` argument
+(alias, hostname or id); without it the `default` workspace is used.
+
+```json
+{
+  "default": "edera",
+  "workspaces": {
+    "edera":    { "id": 10,  "hostname": "study.ed-era.com",          "apiKeyEnv": "WORKADEMY_KEY_EDERA", "readOnly": false },
+    "client-a": { "id": 123, "hostname": "client-a.theworkademy.com", "apiKeyEnv": "WORKADEMY_KEY_CLIENT_A" }
+  }
+}
+```
+
+- **Keys** come from the environment variable named in `apiKeyEnv` (preferred), or from `apiKey` in the file.
+  Keep the file outside git (`workspaces.json` is ignored). Create a key per workspace in its admin settings
+  or with `POST /api/v1/secured/workspaces/{id}/api-key`, and give it a comment such as "Workademy monthly report"
+  so the client can see and revoke it.
+- **Read-only by default.** Workspaces from the file refuse tools that change data (create, update, delete,
+  enroll, complete, …) unless `"readOnly": false` is set.
+- **id** is optional; without it the server looks it up. Setting it avoids one call and allows selecting the workspace by id.
+- `list_configured_workspaces` with `verify: true` checks every key.
+
+Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "workademy": {
+      "command": "node",
+      "args": ["/absolute/path/to/workademy-mcp-server/dist/index.js"],
+      "env": {
+        "WORKADEMY_WORKSPACES_FILE": "/absolute/path/to/workspaces.json",
+        "WORKADEMY_KEY_EDERA": "…",
+        "WORKADEMY_KEY_CLIENT_A": "…",
+        "WORKADEMY_OAUTH_CLIENT_ID": "…",
+        "WORKADEMY_OAUTH_CLIENT_SECRET": "…"
+      }
+    }
+  }
+}
+```
+
+The old single-workspace setup (`WORKADEMY_API_KEY` + `WORKADEMY_BASE_URL`) still works and shows up as the
+workspace `default`. Set `WORKADEMY_READ_ONLY=true` to protect it as well.
+
+**OAuth client.** The token endpoint needs the OAuth client credentials. Set `WORKADEMY_OAUTH_CLIENT_ID` and
+`WORKADEMY_OAUTH_CLIENT_SECRET` (or a base64 `WORKADEMY_OAUTH_CLIENT_BASIC`). Without them the server falls back to
+the built-in legacy value and prints a warning; that value is in the git history, so it should be rotated.
+
+Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSVs, default: the system temp folder).
+
+## Analytics and reporting tools
+
+| Tool | What it returns |
+|---|---|
+| `list_configured_workspaces` | Configured workspaces (never the keys); `verify: true` tests each key |
+| `get_workspace_summary` | Courses (published, active, archived, new in 30 days), users, groups by HR-sync source, learning paths, invitations sent/accepted |
+| `get_analytics` | The admin-dashboard numbers from the analytics service: enrollments, certificates, lectures seen, right/wrong answers, logins, activity. Drill down course → module → lecture → question; totals or timeseries |
+| `get_course_completion` | Completion per course from enrollment records (finished, in progress, not started, inactive, expired, abandoned, avg minutes, avg quiz score); works without the analytics service |
+| `get_group_course_stats` | Completion per department (group) and course; small groups and cells hidden |
+| `export_report` | Runs a CSV export (workspace, course, group, user, learning path), waits, downloads it and returns the path. The file has named data |
+| `get_admin_todos` | Pending enrollment approvals, ungraded open answers, scheduled runs coming up |
+| `get_monthly_report` | Aggregate-only monthly report for a client one-pager: headline numbers, per-course enrollments and completions, certificates, logins, most-missed questions, departments, upcoming runs, admin to-dos |
+
+**Privacy.** The report and stats tools return counts only — no names, e-mails or user ids. Departments with fewer
+than `minGroupSize` members (default 5), department/course cells below that size and questions with fewer answers
+are left out, so nobody can be singled out. Named data only comes from the original per-user tools and from
+`export_report` files.
+
+The analytics service (`/analytics-api/…`) is not in the public Swagger; the paths follow what the Workademy web app
+calls. If a workspace's key cannot reach it, `get_monthly_report` falls back to computing enrollments from the
+core API and says so in `warnings`.
+
+### Testing
+
+`npm run build && npm run test:smoke` starts two mock workspaces and drives the built server over MCP:
+routing, read-only protection, token refresh, analytics paths, the monthly report (with and without
+analytics access), exports and the legacy single-key setup.
+
 ## Available Tools
 
 ### Course Management
