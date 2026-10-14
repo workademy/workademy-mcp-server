@@ -16,8 +16,10 @@ export interface ReportSettings {
     logo?: string | null;
     /** A hand-written lead sentence for this month instead of the automatic one. */
     headline?: string;
-    /** Completions needed in the month to send a report (default 5); quieter months get the win-back email. */
+    /** A month is worth a report with this many completions (default 5)… */
     minCompletions?: number;
+    /** …or this many new enrolments (default 20). Quieter months get the win-back email. */
+    minEnrollments?: number;
     /** Leave this workspace out of the monthly run (internal or demo workspaces). */
     skip?: boolean;
 }

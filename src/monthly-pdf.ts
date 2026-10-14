@@ -19,6 +19,7 @@ import {
 type Browser = import("playwright-core").Browser;
 
 export const DEFAULT_MIN_COMPLETIONS = 5;
+export const DEFAULT_MIN_ENROLLMENTS = 20;
 
 export function reportsDir(month: string): string {
   return path.resolve(process.env.WORKADEMY_REPORTS_DIR || path.join(REPO_ROOT, "reports"), month);
@@ -56,13 +57,32 @@ export function reportProblem(report: any, alias: string): string | null {
   return `could not read the workspace: ${warnings[0] ?? "no data came back"}`;
 }
 
-/** A report is worth sending when people actually finished courses that month. */
+/**
+ * A month is worth a report when people finished courses, or when many enrolled
+ * (a client whose activity is growing should not get a win-back email).
+ */
 export function sendDecision(report: any, settings: ReportSettings | undefined): { send: boolean; reason: string } {
-  const min = Number.isFinite(Number(settings?.minCompletions)) ? Number(settings!.minCompletions) : DEFAULT_MIN_COMPLETIONS;
+  const setting = (value: unknown, fallback: number) => (Number.isFinite(Number(value)) && value !== null ? Number(value) : fallback);
+  const minCompletions = setting(settings?.minCompletions, DEFAULT_MIN_COMPLETIONS);
+  const minEnrollments = setting(settings?.minEnrollments, DEFAULT_MIN_ENROLLMENTS);
   const completions = Number(report?.headline?.completionsThisMonth ?? 0);
-  return completions >= min
-    ? { send: true, reason: `${completions} completions (threshold ${min})` }
-    : { send: false, reason: `${completions} completions, below the threshold of ${min}: send the win-back email instead` };
+  const enrollments = Number(report?.headline?.newEnrollmentsThisMonth ?? 0);
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  if (completions >= minCompletions) {
+    return { send: true, reason: `${plural(completions, "completion")} (threshold ${minCompletions})` };
+  }
+  if (enrollments >= minEnrollments) {
+    return {
+      send: true,
+      reason: `${plural(enrollments, "new enrolment")} (threshold ${minEnrollments}), ${plural(completions, "completion")}`,
+    };
+  }
+  return {
+    send: false,
+    reason:
+      `${plural(completions, "completion")} and ${plural(enrollments, "new enrolment")}, below the thresholds ` +
+      `(${minCompletions} completions or ${minEnrollments} new enrolments): send the win-back email instead`,
+  };
 }
 
 export interface MonthlyPdfResult {

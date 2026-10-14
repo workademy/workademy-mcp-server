@@ -80,8 +80,8 @@ const STRINGS = {
         headlineShare: ({ half, share, m, course }) => half
             ? `More than half of ${EN_MONTHS[m]}’s enrolments (${share}) went to one course: “${course}”.`
             : `${share} of ${EN_MONTHS[m]}’s enrolments went to one course: “${course}”.`,
-        headlineFinishedUp: (n, g, m, pm) => `${n} courses finished in ${EN_MONTHS[m]}, ${g} more than in ${EN_MONTHS[pm]}.`,
-        headlineEnrolledUp: (n, g, m, pm) => `${n} new enrolments in ${EN_MONTHS[m]}, ${g} more than in ${EN_MONTHS[pm]}.`,
+        headlineFinishedUp: (n, b, m, pm) => `${n} courses finished in ${EN_MONTHS[m]}, up from ${b} in ${EN_MONTHS[pm]}.`,
+        headlineEnrolledUp: (n, b, m, pm) => `${n} new enrolments in ${EN_MONTHS[m]}, up from ${b} in ${EN_MONTHS[pm]}.`,
         headlineBusiest: (m, course, n, f) => `The busiest course in ${EN_MONTHS[m]} was “${course}”, with ${f} new ${n === 1 ? "enrolment" : "enrolments"}.`,
         headlineQuiet: (m) => `No new enrolments in ${EN_MONTHS[m]}.`,
     },
@@ -124,8 +124,8 @@ const STRINGS = {
         headlineShare: ({ half, share, m, course }) => half
             ? `Mehr als die Hälfte der Einschreibungen im ${DE_MONTHS[m]} (${share}) entfiel auf einen Kurs: „${course}“.`
             : `${share} der Einschreibungen im ${DE_MONTHS[m]} entfielen auf einen Kurs: „${course}“.`,
-        headlineFinishedUp: (n, g, m, pm) => `${n} abgeschlossene Kurse im ${DE_MONTHS[m]}, ${g} mehr als im ${DE_MONTHS[pm]}.`,
-        headlineEnrolledUp: (n, g, m, pm) => `${n} neue Einschreibungen im ${DE_MONTHS[m]}, ${g} mehr als im ${DE_MONTHS[pm]}.`,
+        headlineFinishedUp: (n, b, m, pm) => `${n} abgeschlossene Kurse im ${DE_MONTHS[m]}, nach ${b} im ${DE_MONTHS[pm]}.`,
+        headlineEnrolledUp: (n, b, m, pm) => `${n} neue Einschreibungen im ${DE_MONTHS[m]}, nach ${b} im ${DE_MONTHS[pm]}.`,
         headlineBusiest: (m, course, n, f) => `Der meistbesuchte Kurs im ${DE_MONTHS[m]}: „${course}“ mit ${n === 1 ? "einer neuen Einschreibung" : `${f} neuen Einschreibungen`}.`,
         headlineQuiet: (m) => `Im ${DE_MONTHS[m]} gab es keine neuen Einschreibungen.`,
     },
@@ -168,8 +168,8 @@ const STRINGS = {
         headlineShare: ({ half, share, m, course }) => half
             ? `Понад половина ${UK_ADJ[m]} записів (${share}) — на курс «${course}».`
             : `${share} ${UK_ADJ[m]} записів — на курс «${course}».`,
-        headlineFinishedUp: (n, g, m, pm) => `Завершених курсів у ${UK_LOC[m]} — ${n}, на ${g} більше, ніж у ${UK_LOC[pm]}.`,
-        headlineEnrolledUp: (n, g, m, pm) => `Нових записів у ${UK_LOC[m]} — ${n}, на ${g} більше, ніж у ${UK_LOC[pm]}.`,
+        headlineFinishedUp: (n, b, m, pm) => `Завершених курсів у ${UK_LOC[m]} — ${n}, а в ${UK_LOC[pm]} було ${b}.`,
+        headlineEnrolledUp: (n, b, m, pm) => `Нових записів у ${UK_LOC[m]} — ${n}, а в ${UK_LOC[pm]} було ${b}.`,
         headlineBusiest: (m, course, n, f) => `Найпопулярніший курс у ${UK_LOC[m]} — «${course}»: ${f} ${ukPlural(n, "новий запис", "нові записи", "нових записів")}.`,
         headlineQuiet: (m) => `У ${UK_LOC[m]} нових записів не було.`,
     },
@@ -324,13 +324,27 @@ export function buildPageModel(report, options) {
     const finished = n0(h.completionsThisMonth);
     const prev = report.previousMonth;
     const prevIndex = prev?.month ? Number(String(prev.month).split("-")[1]) - 1 : (monthIndex + 11) % 12;
-    const growth = (now, before) => (before > 0 ? ((now - before) / before) * 100 : 0);
+    // Growth on last month, told in plain numbers ("up from 5"): percentages on small bases read oddly.
+    // strong = +50% and +10; moderate = +15% and +5. Never a decline in the lead.
+    const prevFinished = n0(prev?.completions);
+    const prevEnrolled = n0(prev?.newEnrollments);
+    const grew = (now, before, pct, abs) => Boolean(prev) && before > 0 && now - before >= abs && now >= before * (1 + pct / 100);
+    const finishedUp = (pct, abs) => finished >= 10 && grew(finished, prevFinished, pct, abs);
+    const enrolledUp = (pct, abs) => enrolled >= 20 && grew(enrolled, prevEnrolled, pct, abs);
+    const share = rows[0] && enrolled >= 20 ? (rows[0].enrolled / enrolled) * 100 : 0;
     if (options.headline && options.headline.trim()) {
         headline = options.headline.trim();
         headlineKind = "custom";
     }
-    else if (rows[0] && enrolled >= 20 && rows[0].enrolled / enrolled >= 0.4) {
-        const share = (rows[0].enrolled / enrolled) * 100;
+    else if (finishedUp(50, 10)) {
+        headline = t.headlineFinishedUp(fmt(finished), fmt(prevFinished), monthIndex, prevIndex);
+        headlineKind = "finished_up";
+    }
+    else if (enrolledUp(50, 10)) {
+        headline = t.headlineEnrolledUp(fmt(enrolled), fmt(prevEnrolled), monthIndex, prevIndex);
+        headlineKind = "enrolled_up";
+    }
+    else if (share >= 40) {
         headline = t.headlineShare({
             half: share > 50,
             share: formatPercent(Math.round(share), lang),
@@ -339,12 +353,12 @@ export function buildPageModel(report, options) {
         });
         headlineKind = "share";
     }
-    else if (prev && n0(prev.completions) >= 5 && finished >= 10 && growth(finished, n0(prev.completions)) >= 15) {
-        headline = t.headlineFinishedUp(fmt(finished), formatPercent(Math.round(growth(finished, n0(prev.completions))), lang), monthIndex, prevIndex);
+    else if (finishedUp(15, 5)) {
+        headline = t.headlineFinishedUp(fmt(finished), fmt(prevFinished), monthIndex, prevIndex);
         headlineKind = "finished_up";
     }
-    else if (prev && n0(prev.newEnrollments) >= 10 && enrolled >= 20 && growth(enrolled, n0(prev.newEnrollments)) >= 15) {
-        headline = t.headlineEnrolledUp(fmt(enrolled), formatPercent(Math.round(growth(enrolled, n0(prev.newEnrollments))), lang), monthIndex, prevIndex);
+    else if (enrolledUp(15, 5)) {
+        headline = t.headlineEnrolledUp(fmt(enrolled), fmt(prevEnrolled), monthIndex, prevIndex);
         headlineKind = "enrolled_up";
     }
     else if (rows[0] && rows[0].enrolled > 0) {

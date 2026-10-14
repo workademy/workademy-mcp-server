@@ -214,7 +214,8 @@ npm run reports -- --all                 # also PDFs for quiet months
 
 The PDFs land in `reports/<month>/<Client>_Workademy_report_<month>.pdf` (git-ignored), with the numbers each one
 was made from (`<workspace>.report.json`, counts only) and `summary.md`:
-who gets the report, who gets the win-back email instead (fewer than 5 completions in the month), and what failed.
+who gets the report, who gets the win-back email instead (fewer than 5 completions and fewer than 20 new
+enrolments in the month), and what failed.
 From Claude, `create_monthly_report_pdf` makes one client's PDF.
 
 A workspace that returns no numbers at all (for example a key Workademy still refuses, which can happen for a few
@@ -234,8 +235,9 @@ Settings per workspace go in a `report` block in `workspaces.json` (all optional
 | `client` | the workspace name; used on the page and in the file name |
 | `language` | `en`, `de` or `uk`; default from the workspace's locale, else `en` |
 | `logo` | URL or file (relative to this folder); default: the workspace's own logo (white logos are skipped) |
-| `headline` | the lead sentence is picked from the data (one course with 40%+ of enrolments, growth on last month, or the busiest course); set this for a hand-written one |
-| `minCompletions` | 5: completions needed for the month to be worth a report |
+| `headline` | the lead sentence is picked from the data (strong growth on last month, one course with 40%+ of enrolments, smaller growth, or the busiest course; never a decline); set this for a hand-written one |
+| `minCompletions` | 5: completions that make the month worth a report… |
+| `minEnrollments` | 20: …or new enrolments (a client whose activity grows gets a report, not a win-back email) |
 | `skip` | leave the workspace out of `npm run reports` (internal or demo workspaces) |
 
 How it works: the page is printed by the Chrome on this computer (through `playwright-core`; no browser download).

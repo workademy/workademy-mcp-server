@@ -2,6 +2,7 @@ import { type ToolContext } from "./extended-tools.js";
 import type { ReportSettings } from "./registry.js";
 type Browser = import("playwright-core").Browser;
 export declare const DEFAULT_MIN_COMPLETIONS = 5;
+export declare const DEFAULT_MIN_ENROLLMENTS = 20;
 export declare function reportsDir(month: string): string;
 /**
  * The numbers a PDF was made from, next to it (counts only, like the report itself), so a client's
@@ -13,7 +14,10 @@ export declare function saveReportData(alias: string, report: any): Promise<stri
  * (Found 15 Oct 2026: keys created a few minutes earlier were refused with 403 on every call.)
  */
 export declare function reportProblem(report: any, alias: string): string | null;
-/** A report is worth sending when people actually finished courses that month. */
+/**
+ * A month is worth a report when people finished courses, or when many enrolled
+ * (a client whose activity is growing should not get a win-back email).
+ */
 export declare function sendDecision(report: any, settings: ReportSettings | undefined): {
     send: boolean;
     reason: string;

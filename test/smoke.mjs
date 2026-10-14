@@ -294,7 +294,21 @@ await check("one-pager wording: numbers, plurals, questions, file names, lead se
   assert.equal(kind(base({ topCoursesThisMonth: [{ course: "Onboarding: first week", enrolled: 60, finished: 5 }] })).headlineKind, "share");
   assert.match(kind(base({ topCoursesThisMonth: [{ course: "Onboarding: first week", enrolled: 60, finished: 5 }] }), "uk").headline, /^Понад половина вересневих записів \(60%\) — на курс «Onboarding»\.$/);
   assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 90, completions: 20 } })).headlineKind, "finished_up");
-  assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 90, completions: 20 } })).headline, "40 courses finished in September, 100% more than in August.");
+  assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 90, completions: 20 } })).headline, "40 courses finished in September, up from 20 in August.");
+  // a client whose enrolments jump (CLARKademy, Sep 2026: 28 new, 5 in August, 1 completion)
+  const clark = base({
+    headline: { newEnrollmentsThisMonth: 28, completionsThisMonth: 1, certificatesThisMonth: 1, activeUsers: 9 },
+    topCoursesThisMonth: [{ course: "Onboarding: first week", enrolled: 12, finished: 1 }],
+    previousMonth: { month: "2026-08", newEnrollments: 5, completions: 0 },
+  });
+  assert.equal(kind(clark).headline, "28 new enrolments in September, up from 5 in August.", "strong growth leads, even before a 40% course");
+  assert.equal(kind(clark, "de").headline, "28 neue Einschreibungen im September, nach 5 im August.");
+  assert.equal(kind(clark, "uk").headline, "Нових записів у вересні — 28, а в серпні було 5.");
+  const { sendDecision } = await import("../dist/monthly-pdf.js");
+  assert.deepEqual(sendDecision(clark, undefined), { send: true, reason: "28 new enrolments (threshold 20), 1 completion" });
+  assert.deepEqual(sendDecision(base({}), undefined), { send: true, reason: "40 completions (threshold 5)" });
+  assert.equal(sendDecision(clark, { minEnrollments: 50 }).send, false);
+  assert.match(sendDecision(base({ headline: { newEnrollmentsThisMonth: 9, completionsThisMonth: 0 } }), undefined).reason, /^0 completions and 9 new enrolments, below the thresholds \(5 completions or 20 new enrolments\)/);
   assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 50, completions: 40 } })).headlineKind, "enrolled_up");
   assert.equal(kind(base({ previousMonth: { month: "2026-08", newEnrollments: 150, completions: 60 } })).headlineKind, "busiest", "no bad news in the lead");
   assert.equal(kind(base({ headline: { newEnrollmentsThisMonth: 0, completionsThisMonth: 0 }, topCoursesThisMonth: [] })).headlineKind, "quiet");
@@ -463,7 +477,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
     JSON.stringify({
       workspaces: {
         edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", report: { client: "EdEra", language: "uk", logo: "assets/workademy-logo.png" } },
-        client: { name: "Client", baseUrl: b.url, apiKeyEnv: "KEY_CLIENT", report: { minCompletions: 100000 } },
+        client: { name: "Client", baseUrl: b.url, apiKeyEnv: "KEY_CLIENT", report: { minCompletions: 100000, minEnrollments: 100000 } },
         // a key the API refuses: every call fails, which must not look like a quiet month
         refused: { id: 20, name: "Refused", baseUrl: b.url, apiKeyEnv: "KEY_REFUSED" },
         demo: { name: "Demo", hostname: "demo.example", report: { skip: true } },
@@ -494,7 +508,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   assert.ok(fs.existsSync(edera.pdfPath));
   assert.ok(!edera.warnings.some((w) => w.startsWith("No usable client logo")), "logo file from workspaces.json used");
   const md = fs.readFileSync(path.join(out, "2026-09", "summary.md"), "utf8");
-  assert.match(md, /## Win-back email instead \(1\)[\s\S]*\*\*Client\*\* \(client\): \d+ completions, below the threshold of 100000/);
+  assert.match(md, /## Win-back email instead \(1\)[\s\S]*\*\*Client\*\* \(client\): \d+ completions? and \d+ new enrolments?, below the thresholds \(100000 completions or 100000 new enrolments\)/);
   assert.match(md, /## Failed \(2\)\n\n- refused: Workademy refused access \(401\)[^\n]*--only refused\.\n- missing: no API key/);
   assert.ok(md.includes("npm run reports -- --month 2026-09 --only refused,missing"), "ready-to-paste rerun command");
   assert.ok(!fs.existsSync(path.join(out, "2026-09", "refused.report.json")), "no data file for a failed workspace");
