@@ -815,8 +815,8 @@ function getClient(workspace: WorkspaceConfig): WorkademyClient {
     if (!workspace.apiKey) {
       throw new McpError(
         ErrorCode.InvalidRequest,
-        `No API key for workspace "${workspace.alias}"` +
-          (workspace.apiKeyEnv ? ` (environment variable ${workspace.apiKeyEnv} is not set)` : "")
+        `No API key for workspace "${workspace.alias}". Run "npm run keys" in the workademy-mcp-server folder` +
+          (workspace.apiKeyEnv ? ` or set the environment variable ${workspace.apiKeyEnv}` : "")
       );
     }
     client = new WorkademyClient({

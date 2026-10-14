@@ -298,6 +298,9 @@ async function groupStats(client, group, options) {
         if (!byCourse.has(courseId))
             byCourse.set(courseId, new EnrollmentStats());
         byCourse.get(courseId).add(userCourse, options.period);
+        if (!options.courseNames.has(courseId) && userCourse?.course?.name) {
+            options.courseNames.set(courseId, stripHtml(userCourse.course.name));
+        }
     }
     let suppressedCourses = 0;
     const courses = [];
@@ -472,8 +475,19 @@ async function courseCompletion(ctx, args) {
     const start = toEpochMs(args.start, "start");
     const period = start !== undefined || end !== undefined ? { start: start ?? 0, end: end ?? Date.now() } : undefined;
     const warnings = [];
-    const { names, items } = await loadCourseNames(client);
-    const courseIds = args.courseId !== undefined ? [Number(args.courseId)] : items.map((c) => c.id);
+    let names = new Map();
+    let courseIds;
+    if (args.courseId !== undefined) {
+        courseIds = [Number(args.courseId)];
+        const course = await safe("course", warnings, () => client.request("GET", `/api/v1/secured/courses/${courseIds[0]}`));
+        if (course?.name)
+            names.set(courseIds[0], stripHtml(course.name));
+    }
+    else {
+        const list = await loadCourseNames(client);
+        names = list.names;
+        courseIds = list.items.map((c) => c.id);
+    }
     const limit = clampInt(args.maxCourses, 50, 1, 200);
     if (courseIds.length > limit) {
         warnings.push(`Only the first ${limit} of ${courseIds.length} courses were included (maxCourses).`);
@@ -505,7 +519,7 @@ async function groupCourseStats(ctx, args) {
     const end = toEpochMs(args.end, "end", true);
     const start = toEpochMs(args.start, "start");
     const period = start !== undefined || end !== undefined ? { start: start ?? 0, end: end ?? Date.now() } : undefined;
-    const { names } = await loadCourseNames(client);
+    const names = new Map(); // filled from the enrollment records
     let groups;
     if (args.groupId !== undefined) {
         groups = [await client.request("GET", `/api/v1/secured/groups/${args.groupId}`)];
@@ -604,8 +618,9 @@ async function monthlyReport(ctx, args) {
     const workspaceId = await client.getWorkspaceId();
     const info = await safe("workspace", warnings, () => client.request("GET", `/api/v1/secured/workspaces/${workspaceId}`));
     const since = typeof info?.createTime === "number" ? info.createTime : 0;
-    const courseList = await safe("courses", warnings, () => loadCourseNames(client));
-    const courseNames = courseList?.names ?? new Map();
+    // Large workspaces have thousands of courses: count them here, load the full list only for the fallback
+    const courseCount = await safe("course count", warnings, () => countOf(client, "/api/v1/secured/courses"));
+    const courseNames = new Map();
     const userCount = await safe("users", warnings, () => countOf(client, "/api/v1/secured/users"));
     const groupList = await safe("groups", warnings, () => fetchAllPages(client, "/api/v1/secured/groups"));
     // --- Analytics service (same numbers the client sees on their dashboard) ---
@@ -631,46 +646,68 @@ async function monthlyReport(ctx, args) {
     };
     const periodWindow = { start: period.start, end: period.end };
     const toDateWindow = { start: since, end: period.end };
-    const enrollToDate = await facts("enrollments to date", {
+    // Workspace totals (one row) for the headline; per-course rows sorted so the biggest courses come first
+    const totalsToDate = await facts("totals to date", {
         fact: "usercourse",
-        breakdown: "course",
+        breakdown: "none",
         ...toDateWindow,
         aggregationType: "YEAR",
-        size: 500,
+    });
+    const totalsPeriod = await facts("totals this month", {
+        fact: "usercourse",
+        breakdown: "none",
+        ...periodWindow,
+        aggregationType: "MONTH",
+    });
+    const certTotalsPeriod = await facts("certificates this month", {
+        fact: "certificate",
+        breakdown: "none",
+        ...periodWindow,
+        aggregationType: "MONTH",
+    });
+    const perCourse = { breakdown: "course", size: 100, sort: "amountStarted", sortDir: "desc" };
+    const enrollToDate = await facts("enrollments to date", {
+        fact: "usercourse",
+        ...perCourse,
+        ...toDateWindow,
+        aggregationType: "YEAR",
     });
     const enrollPeriod = await facts("enrollments this month", {
         fact: "usercourse",
-        breakdown: "course",
+        ...perCourse,
         ...periodWindow,
         aggregationType: "MONTH",
-        size: 500,
     });
     const certsPeriod = await facts("certificates", {
         fact: "certificate",
-        breakdown: "course",
+        ...perCourse,
+        sort: "amountIssued",
         ...periodWindow,
         aggregationType: "MONTH",
-        size: 500,
     });
     const usersPeriod = await facts("logins", { fact: "workspace_users", ...periodWindow, aggregationType: "MONTH" });
     const activity = await facts("activity", { fact: "activity", ...periodWindow, aggregationType: "MONTH" });
     let courses = [];
+    let coursesWithActivity = null;
     if (enrollToDate?.rows) {
         sources.enrollments = "analytics API";
         const periodByCourse = new Map((enrollPeriod?.rows ?? []).map((r) => [r.courseId, r]));
         const certsByCourse = new Map((certsPeriod?.rows ?? []).map((r) => [r.courseId, r]));
+        coursesWithActivity = enrollToDate.page?.totalElements ?? enrollToDate.rows.length;
+        // Note: amountMsCourseStarted is not filled in production data, so "started" is left out here.
         courses = enrollToDate.rows.map((r) => {
             const p = periodByCourse.get(r.courseId) ?? {};
             const c = certsByCourse.get(r.courseId) ?? {};
             const enrolled = num(r.amountStarted);
             const finished = num(r.amountEnded);
             const abandoned = num(r.amountAbandoned);
+            const name = r.courseName ?? String(r.courseId);
+            courseNames.set(r.courseId, name);
             return {
                 courseId: r.courseId,
-                course: r.courseName ?? courseNames.get(r.courseId) ?? String(r.courseId),
+                course: name,
                 toDate: {
                     enrolled,
-                    started: num(r.amountMsCourseStarted),
                     finished,
                     abandoned,
                     open: Math.max(enrolled - finished - abandoned, 0),
@@ -679,7 +716,6 @@ async function monthlyReport(ctx, args) {
                 },
                 thisMonth: {
                     enrolled: num(p.amountStarted),
-                    started: num(p.amountMsCourseStarted),
                     finished: num(p.amountEnded),
                     abandoned: num(p.amountAbandoned),
                     certificatesIssued: num(c.amountIssued),
@@ -688,9 +724,12 @@ async function monthlyReport(ctx, args) {
             };
         });
     }
-    else if (courseList) {
+    else {
         sources.enrollments = "core API (computed from enrollment records)";
-        const ids = courseList.items.map((c) => c.id);
+        const courseList = await safe("courses", warnings, () => loadCourseNames(client));
+        for (const [id, name] of courseList?.names ?? [])
+            courseNames.set(id, name);
+        const ids = (courseList?.items ?? []).map((c) => c.id);
         if (ids.length > 60)
             warnings.push(`Only the first 60 of ${ids.length} courses were counted.`);
         const results = await mapLimit(ids.slice(0, 60), 4, async (courseId) => ({
@@ -722,17 +761,26 @@ async function monthlyReport(ctx, args) {
                 },
             });
         }
+        coursesWithActivity = courses.filter((c) => num(c.toDate.enrolled) > 0).length;
     }
-    const withoutEnrollments = (courseList?.items.length ?? 0) - courses.filter((c) => num(c.toDate.enrolled) > 0).length;
     courses = courses.filter((c) => num(c.toDate.enrolled) > 0).sort((a, b) => num(b.toDate.enrolled) - num(a.toDate.enrolled));
     const sum = (pick) => courses.reduce((total, c) => total + num(pick(c)), 0);
-    const enrolledToDate = sum((c) => c.toDate.enrolled);
-    const finishedToDate = sum((c) => c.toDate.finished);
+    // Prefer the workspace-total rows: per-course rows are capped at the 100 biggest courses
+    const totalToDate = totalsToDate?.rows?.[0];
+    const totalPeriod = totalsPeriod?.rows?.[0];
+    const enrolledToDate = totalToDate ? num(totalToDate.amountStarted) : sum((c) => c.toDate.enrolled);
+    const finishedToDate = totalToDate ? num(totalToDate.amountEnded) : sum((c) => c.toDate.finished);
+    const abandonedToDate = totalToDate ? num(totalToDate.amountAbandoned) : sum((c) => c.toDate.abandoned);
+    const enrolledThisMonth = totalPeriod ? num(totalPeriod.amountStarted) : sum((c) => c.thisMonth.enrolled);
+    const finishedThisMonth = totalPeriod ? num(totalPeriod.amountEnded) : sum((c) => c.thisMonth.finished);
     // --- Where people struggle: drill course -> module -> lecture -> question on wrong answers ---
     let hotspots = null;
     if (analyticsAvailable && courses.length > 0) {
         sources.questions = "analytics API";
-        const candidates = courses.slice(0, 5).map((c) => c.courseId);
+        const candidates = [...courses]
+            .sort((a, b) => num(b.thisMonth.enrolled) - num(a.thisMonth.enrolled) || num(b.toDate.enrolled) - num(a.toDate.enrolled))
+            .slice(0, 5)
+            .map((c) => c.courseId);
         const quiet = (query) => safe(`questions ${query.courseId}/${query.moduleId ?? ""}/${query.lectureId ?? ""}`, warnings, () => fetchFacts(client, workspaceId, query));
         const byWrong = (a, b) => num(b.amountWrong) - num(a.amountWrong);
         const collect = async (window) => {
@@ -805,7 +853,9 @@ async function monthlyReport(ctx, args) {
         : null;
     const upcoming = await safe("schedules", warnings, () => upcomingSchedules(client, 31));
     const todos = await adminTodoCounts(client, warnings);
-    const certificatesThisMonth = sum((c) => c.thisMonth.certificatesIssued);
+    const certificatesThisMonth = certTotalsPeriod?.rows?.[0]
+        ? num(certTotalsPeriod.rows[0].amountIssued)
+        : sum((c) => c.thisMonth.certificatesIssued);
     return {
         workspace: {
             alias: ctx.workspace.alias,
@@ -820,20 +870,20 @@ async function monthlyReport(ctx, args) {
         sources,
         headline: {
             learners: userCount,
-            coursesWithEnrollments: courses.length,
+            courses: courseCount,
+            coursesWithActivity,
             enrollmentsToDate: enrolledToDate,
             completionsToDate: finishedToDate,
             completionRateToDate: rate(finishedToDate, enrolledToDate),
-            openToDate: sum((c) => c.toDate.open),
-            newEnrollmentsThisMonth: sum((c) => c.thisMonth.enrolled),
-            completionsThisMonth: sum((c) => c.thisMonth.finished),
+            openToDate: Math.max(enrolledToDate - finishedToDate - abandonedToDate, 0),
+            newEnrollmentsThisMonth: enrolledThisMonth,
+            completionsThisMonth: finishedThisMonth,
             certificatesThisMonth: sources.enrollments === "analytics API" ? certificatesThisMonth : null,
             logins: engagement?.logins ?? null,
             activeUsers: engagement?.activeUsers ?? null,
         },
         courses: courses.slice(0, 25),
-        coursesOmitted: Math.max(courses.length - 25, 0),
-        coursesWithoutEnrollments: Math.max(withoutEnrollments, 0),
+        coursesOmitted: Math.max(num(coursesWithActivity) - Math.min(courses.length, 25), 0),
         struggleHotspots: hotspots,
         departments,
         engagement,

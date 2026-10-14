@@ -16,6 +16,8 @@ export interface WorkspaceConfig {
     readOnly: boolean;
     source: "file" | "env";
 }
+/** workspaces.json in the project folder (next to package.json) is picked up without any env setting. */
+export declare const DEFAULT_WORKSPACES_FILE: string;
 /** Base64 "client_id:client_secret" used as Basic auth on /oauth/token. */
 export declare function oauthClientBasic(env?: NodeJS.ProcessEnv): string;
 export declare class WorkspaceRegistry {
@@ -23,9 +25,10 @@ export declare class WorkspaceRegistry {
     readonly defaultAlias: string;
     private constructor();
     /**
-     * Loads workspaces from WORKADEMY_WORKSPACES_FILE when set.
+     * Loads workspaces from WORKADEMY_WORKSPACES_FILE, or from workspaces.json in the project folder.
      * Otherwise falls back to the original single-workspace env setup
      * (WORKADEMY_API_KEY + WORKADEMY_BASE_URL), exposed under the alias "default".
+     * WORKADEMY_WORKSPACES_FILE=none forces the single-workspace setup.
      */
     static load(env?: NodeJS.ProcessEnv): WorkspaceRegistry;
     private static fromFile;

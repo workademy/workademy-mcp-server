@@ -3,6 +3,8 @@
 // analytics paths, the monthly report and the legacy single-key setup.
 // Run with: npm run build && npm run test:smoke
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +15,10 @@ import { LEARNER_NAMES, startMock } from "./mock-workademy.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverEntry = path.join(here, "..", "dist", "index.js");
+const keysScript = path.join(here, "..", "scripts", "create-api-keys.mjs");
+// async on purpose: the mock servers live in this process and must keep answering
+const runScript = async (args, env) =>
+  (await promisify(execFile)(process.execPath, [keysScript, ...args], { env: { ...baseEnv, ...env }, encoding: "utf8" })).stdout;
 const CLIENT_BASIC = Buffer.from("test-client:test-secret").toString("base64");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "workademy-mcp-smoke-"));
 
@@ -60,8 +66,14 @@ async function check(label, fn) {
   }
 }
 
-const a = await startMock({ workspaceId: 10, name: "EdEra (mock)", apiKey: "key-a", clientBasic: CLIENT_BASIC, host: "127.0.0.1" });
-const b = await startMock({ workspaceId: 20, name: "Client (mock)", apiKey: "key-b", clientBasic: CLIENT_BASIC, analytics: false, host: "localhost" });
+const users = { "olga@example.com": "pw-secret" };
+const userWorkspaces = []; // filled once both hosts are known
+const a = await startMock({ workspaceId: 10, name: "EdEra (mock)", apiKey: "key-a", clientBasic: CLIENT_BASIC, host: "127.0.0.1", users, userWorkspaces });
+const b = await startMock({ workspaceId: 20, name: "Client (mock)", apiKey: "key-b", clientBasic: CLIENT_BASIC, analytics: false, host: "localhost", users });
+userWorkspaces.push(
+  { id: 10, name: "EdEra (mock)", hostname: new URL(a.url).host, admin: true },
+  { id: 20, name: "Client (mock)", hostname: new URL(b.url).host, admin: true }
+);
 
 const workspacesFile = path.join(tmp, "workspaces.json");
 fs.writeFileSync(
@@ -70,17 +82,18 @@ fs.writeFileSync(
     default: "edera",
     workspaces: {
       edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", readOnly: false },
-      client: { name: "Client", baseUrl: b.url, apiKeyEnv: "KEY_CLIENT" },
+      client: { name: "Client", baseUrl: b.url }, // key comes from workspaces.keys.json
       missing: { hostname: "missing.example", apiKeyEnv: "KEY_NOT_SET" },
     },
   })
 );
+fs.writeFileSync(path.join(tmp, "workspaces.keys.json"), JSON.stringify({ client: "key-b" }));
 
 const now = new Date();
 const thisMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 
 console.log("multi-workspace mode");
-const mcp = await connect({ WORKADEMY_WORKSPACES_FILE: workspacesFile, KEY_EDERA: "key-a", KEY_CLIENT: "key-b" });
+const mcp = await connect({ WORKADEMY_WORKSPACES_FILE: workspacesFile, KEY_EDERA: "key-a" });
 
 await check("every tool except list_configured_workspaces takes `workspace`", async () => {
   const { tools } = await mcp.listTools();
@@ -152,6 +165,7 @@ await check("persistent 401: one retry, then a clear error (no loop)", async () 
   await assert.rejects(() => call(mcp, "get_current_user"), /401.*edera.*GET \/api\/v1\/secured\/users\/me/s);
   const after = a.state.log.filter((r) => r.path === "/api/v1/secured/users/me").length;
   assert.equal(after - before, 2, "original request + exactly one retry");
+  await fetch(`${a.url}/__control/reset401`);
 });
 
 await check("get_analytics builds the dashboard's drill-down path and labels rows", async () => {
@@ -198,12 +212,15 @@ await check("monthly report (analytics): aggregates, hotspots, small groups hidd
   assert.equal(r.headline.completionsToDate, 125);
   assert.equal(r.headline.completionRateToDate, 73.5);
   assert.equal(r.headline.newEnrollmentsThisMonth, 32);
+  assert.equal(r.headline.completionsThisMonth, 14);
+  assert.equal(r.headline.openToDate, 43);
   assert.equal(r.headline.certificatesThisMonth, 9);
   assert.equal(r.headline.logins, 230);
   assert.equal(r.headline.activeUsers, 37);
   assert.equal(r.courses[0].course, "Data protection refresher", "HTML stripped from names");
   assert.equal(r.courses[0].toDate.open, 28);
-  assert.equal(r.coursesWithoutEnrollments, 1);
+  assert.deepEqual([r.headline.courses, r.headline.coursesWithActivity], [3, 2]);
+  assert.ok(!("started" in r.courses[0].toDate), "always-zero metric left out");
   assert.equal(r.struggleHotspots.questions.length, 1, "question with fewer than 5 answers left out");
   assert.equal(r.struggleHotspots.questions[0].wrongRate, 64.3);
   assert.equal(r.struggleHotspots.questions[0].lecture, "Reporting a breach");
@@ -257,7 +274,7 @@ await check("get_admin_todos", async () => {
 await mcp.close();
 
 console.log("legacy single-key mode (WORKADEMY_API_KEY + WORKADEMY_BASE_URL)");
-const legacy = await connect({ WORKADEMY_API_KEY: "key-a", WORKADEMY_BASE_URL: a.url });
+const legacy = await connect({ WORKADEMY_API_KEY: "key-a", WORKADEMY_BASE_URL: a.url, WORKADEMY_WORKSPACES_FILE: "none" });
 await check("old configuration keeps working, writes allowed", async () => {
   const ws = await call(legacy, "list_configured_workspaces");
   assert.deepEqual(ws.workspaces.map((w) => [w.alias, w.readOnly]), [["default", false]]);
@@ -266,6 +283,60 @@ await check("old configuration keeps working, writes allowed", async () => {
   await call(legacy, "delete_course", { courseId: 103 });
 });
 await legacy.close();
+
+console.log("key setup script (npm run keys)");
+await check("creates keys without printing them; the server picks them up", async () => {
+  const setupDir = path.join(tmp, "setup");
+  fs.mkdirSync(setupDir);
+  const file = path.join(setupDir, "workspaces.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ default: "edera", workspaces: { edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", readOnly: false } } })
+  );
+  const run = (only) =>
+    runScript(["--file", file, "--host", new URL(a.url).host, "--only", only], {
+      WORKADEMY_KEYS_SCHEME: "http",
+      WORKADEMY_LOGIN_EMAIL: "olga@example.com",
+      WORKADEMY_LOGIN_PASSWORD: "pw-secret",
+    });
+  const out = await run("client, edera");
+  assert.match(out, /created\s+client-mock \(localhost:\d+, id 20\)/);
+  assert.match(out, /skipped\s+edera: already has a key/);
+  assert.ok(!out.includes("key-new") && !out.includes("pw-secret"), "no secrets in the output");
+  const config = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(config.workspaces["client-mock"].readOnly, true);
+  assert.ok(!JSON.stringify(config).includes("key-new"), "workspaces.json holds no keys");
+  const keysFile = path.join(setupDir, "workspaces.keys.json");
+  assert.equal(fs.statSync(keysFile).mode & 0o777, 0o600);
+  assert.match(JSON.parse(fs.readFileSync(keysFile, "utf8"))["client-mock"], /^key-new-20-/);
+  assert.match(b.state.createdKeys[0].comment, /created by olga@example.com/);
+
+  const server = await connect({ WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a" });
+  try {
+    const listed = await call(server, "list_configured_workspaces", { verify: true });
+    assert.deepEqual(listed.workspaces.map((w) => [w.alias, w.verified.ok]), [["edera", true], ["client-mock", true]]);
+  } finally {
+    await server.close();
+  }
+
+  assert.match(await run("client"), /skipped\s+client-mock: already has a key/);
+  assert.equal(b.state.createdKeys.length, 1, "no second key");
+});
+
+await check("wrong password: clear message, password not echoed", async () => {
+  let output = "";
+  try {
+    await runScript(["--list", "--file", path.join(tmp, "x.json"), "--host", new URL(a.url).host], {
+      WORKADEMY_KEYS_SCHEME: "http",
+      WORKADEMY_LOGIN_EMAIL: "olga@example.com",
+      WORKADEMY_LOGIN_PASSWORD: "wrong-pass",
+    });
+  } catch (error) {
+    output = `${error.stdout}${error.stderr}`;
+  }
+  assert.match(output, /login at .* failed \(400\): Bad credentials/);
+  assert.ok(!output.includes("wrong-pass"));
+});
 
 await a.close();
 await b.close();

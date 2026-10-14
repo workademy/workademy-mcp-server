@@ -2,3 +2,4 @@
 node_modules
 workspaces.json
 .env
+workspaces.keys.json

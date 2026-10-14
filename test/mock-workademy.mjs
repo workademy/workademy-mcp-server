@@ -36,9 +36,29 @@ function page(items, query) {
   return { content, totalElements: items.length, totalPages, number, size, last: number >= totalPages - 1 };
 }
 
-export async function startMock({ workspaceId, name, apiKey, clientBasic, analytics = true, host = "127.0.0.1" }) {
+const WEBAPP_CLIENT = "d2ViYXBwOnRlc3Q="; // the web app's password-login client
+
+export async function startMock({
+  workspaceId,
+  name,
+  apiKey,
+  clientBasic,
+  analytics = true,
+  host = "127.0.0.1",
+  users = {}, // e-mail -> password, for the password grant
+  userWorkspaces = null, // what GET /workspaces returns for a logged-in user
+}) {
   const now = Date.now();
-  const state = { log: [], tokens: new Set(), tokenRequests: 0, always401: new Set(), polls: 0 };
+  const state = {
+    log: [],
+    tokens: new Set(),
+    userTokens: new Set(),
+    apiKeys: new Set([apiKey]),
+    createdKeys: [],
+    tokenRequests: 0,
+    always401: new Set(),
+    polls: 0,
+  };
 
   const courses = [
     { id: 101, name: "<p>Data protection refresher</p>", published: true, active: true, createTime: now - 40 * DAY },
@@ -85,6 +105,17 @@ export async function startMock({ workspaceId, name, apiKey, clientBasic, analyt
           extra: courseExtra,
           totalElements: 2,
         };
+      case `${ws}/facts/usercourse`:
+        return {
+          content: [
+            toDate
+              ? { courseId: null, amountStarted: 170, amountEnded: 125, amountAbandoned: 2 }
+              : { courseId: null, amountStarted: 32, amountEnded: 14, amountAbandoned: 0 },
+          ],
+          totalElements: 1,
+        };
+      case `${ws}/facts/certificate`:
+        return { content: [{ courseId: null, amountIssued: 9, avgScore: 88.46 }], totalElements: 1 };
       case `${ws}/courses/facts/certificate`:
         return { content: [{ courseId: 101, amountIssued: 9, avgScore: 88.46, minScore: 70, maxScore: 100 }], extra: courseExtra };
       case `${ws}/courses/101/modules/facts/questionanswer`:
@@ -115,10 +146,19 @@ export async function startMock({ workspaceId, name, apiKey, clientBasic, analyt
     }
   };
 
-  const coreRoute = (method, path, query) => {
+  const coreRoute = (method, path, query, isUser, body) => {
     let m;
     if (method === "GET" && path === "/api/v1/secured/workspaces")
-      return page([{ id: workspaceId, name, hostname: new URL(base).host }], query);
+      return page(isUser && userWorkspaces ? userWorkspaces : [{ id: workspaceId, name, hostname: new URL(base).host }], query);
+    if (method === "POST" && path === `/api/v1/secured/workspaces/${workspaceId}/api-key`) {
+      if (!isUser) return { __status: 403, message: "admins only" };
+      const key = `key-new-${workspaceId}-${state.createdKeys.length + 1}`;
+      state.apiKeys.add(key);
+      state.createdKeys.push({ key, comment: body?.comment });
+      return { id: state.createdKeys.length, comment: body?.comment, apiKey: key };
+    }
+    if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/courses\/(\d+)$/)))
+      return courses.find((c) => String(c.id) === m[1]);
     if (method === "GET" && path === `/api/v1/secured/workspaces/${workspaceId}`)
       return { id: workspaceId, name, hostname: new URL(base).host, createTime: now - 365 * DAY, locale: "de_DE" };
     if (method === "GET" && path === "/api/v1/secured/users/me")
@@ -176,6 +216,10 @@ export async function startMock({ workspaceId, name, apiKey, clientBasic, analyt
         state.tokens.clear();
         return send(200, { ok: true });
       }
+      if (path === "/__control/reset401") {
+        state.always401.clear();
+        return send(200, { ok: true });
+      }
       if (path === "/__control/always401") {
         state.always401.add(url.searchParams.get("path"));
         return send(200, { ok: true });
@@ -183,8 +227,17 @@ export async function startMock({ workspaceId, name, apiKey, clientBasic, analyt
       if (path === "/oauth/token" && req.method === "POST") {
         state.tokenRequests += 1;
         const form = new URLSearchParams(body);
+        if (form.get("grant_type") === "password") {
+          if (auth !== `Basic ${WEBAPP_CLIENT}`) return send(401, { error: "invalid_client" });
+          if (!users[form.get("username")] || users[form.get("username")] !== form.get("password"))
+            return send(400, { error: "invalid_grant", error_description: "Bad credentials" });
+          const token = `user-${workspaceId}-${state.tokenRequests}`;
+          state.tokens.add(token);
+          state.userTokens.add(token);
+          return send(200, { access_token: token, token_type: "bearer", expires_in: 3600 });
+        }
         if (auth !== `Basic ${clientBasic}`) return send(401, { error: "invalid_client" });
-        if (form.get("grant_type") !== "api_key" || form.get("api_key") !== apiKey)
+        if (form.get("grant_type") !== "api_key" || !state.apiKeys.has(form.get("api_key")))
           return send(401, { error: "invalid_grant" });
         const token = `tok-${workspaceId}-${state.tokenRequests}`;
         state.tokens.add(token);
@@ -203,8 +256,11 @@ export async function startMock({ workspaceId, name, apiKey, clientBasic, analyt
         const result = analyticsRoute(path, url.searchParams);
         return result === undefined ? send(404, { error: "Not Found" }) : send(200, result);
       }
-      const result = coreRoute(req.method, path, url.searchParams);
+      let parsedBody = null;
+      try { parsedBody = body ? JSON.parse(body) : null; } catch { parsedBody = null; }
+      const result = coreRoute(req.method, path, url.searchParams, state.userTokens.has(token), parsedBody);
       if (result === undefined) return send(404, { message: `mock: no route for ${req.method} ${path}` });
+      if (result && result.__status) return send(result.__status, { message: result.message });
       return result === null ? send(204, null) : send(200, result);
     });
   });

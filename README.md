@@ -125,24 +125,27 @@ Add this to your Claude Desktop config file:
 ## Multiple workspaces
 
 A Workademy API key belongs to exactly one workspace, and the API picks the workspace from the
-hostname you call. To work with several workspaces, list them in a JSON file and point
-`WORKADEMY_WORKSPACES_FILE` at it. Every tool then takes an optional `workspace` argument
+hostname you call. To work with several workspaces, list them in `workspaces.json` in the project folder
+(found automatically) or point `WORKADEMY_WORKSPACES_FILE` at another file. Every tool then takes an optional `workspace` argument
 (alias, hostname or id); without it the `default` workspace is used.
 
 ```json
 {
   "default": "edera",
   "workspaces": {
-    "edera":    { "id": 10,  "hostname": "study.ed-era.com",          "apiKeyEnv": "WORKADEMY_KEY_EDERA", "readOnly": false },
-    "client-a": { "id": 123, "hostname": "client-a.theworkademy.com", "apiKeyEnv": "WORKADEMY_KEY_CLIENT_A" }
+    "edera":    { "id": 10,  "hostname": "study.ed-era.com",          "apiKeyEnv": "WORKADEMY_API_KEY", "readOnly": false },
+    "client-a": { "id": 123, "hostname": "client-a.theworkademy.com", "readOnly": true }
   }
 }
 ```
 
-- **Keys** come from the environment variable named in `apiKeyEnv` (preferred), or from `apiKey` in the file.
-  Keep the file outside git (`workspaces.json` is ignored). Create a key per workspace in its admin settings
-  or with `POST /api/v1/secured/workspaces/{id}/api-key`, and give it a comment such as "Workademy monthly report"
-  so the client can see and revoke it.
+- **Keys: `npm run keys`.** It asks for your Workademy login (the password is not shown), lists the workspaces your
+  account can see, creates an API key in the ones you pick (`POST /api/v1/secured/workspaces/{id}/api-key`, with a
+  comment saying who created it, so the client can see and revoke it), adds them to `workspaces.json` and stores the
+  keys in `workspaces.keys.json` (permissions 600). Neither the password nor the keys are printed.
+  Options: `--list`, `--only "Kognic, Clark"`, `--host`, `--force`. Both files are git-ignored.
+- A key can also come from an environment variable named in `apiKeyEnv`; it wins over the keys file.
+  `WORKADEMY_WORKSPACES_FILE=none` forces the old single-workspace setup.
 - **Read-only by default.** Workspaces from the file refuse tools that change data (create, update, delete,
   enroll, complete, …) unless `"readOnly": false` is set.
 - **id** is optional; without it the server looks it up. Setting it avoids one call and allows selecting the workspace by id.
@@ -157,11 +160,7 @@ Claude Desktop:
       "command": "node",
       "args": ["/absolute/path/to/workademy-mcp-server/dist/index.js"],
       "env": {
-        "WORKADEMY_WORKSPACES_FILE": "/absolute/path/to/workspaces.json",
-        "WORKADEMY_KEY_EDERA": "…",
-        "WORKADEMY_KEY_CLIENT_A": "…",
-        "WORKADEMY_OAUTH_CLIENT_ID": "…",
-        "WORKADEMY_OAUTH_CLIENT_SECRET": "…"
+        "WORKADEMY_API_KEY": "… (only for entries that use apiKeyEnv)"
       }
     }
   }
@@ -171,9 +170,8 @@ Claude Desktop:
 The old single-workspace setup (`WORKADEMY_API_KEY` + `WORKADEMY_BASE_URL`) still works and shows up as the
 workspace `default`. Set `WORKADEMY_READ_ONLY=true` to protect it as well.
 
-**OAuth client.** The token endpoint needs the OAuth client credentials. Set `WORKADEMY_OAUTH_CLIENT_ID` and
-`WORKADEMY_OAUTH_CLIENT_SECRET` (or a base64 `WORKADEMY_OAUTH_CLIENT_BASIC`). Without them the server falls back to
-the built-in legacy value and prints a warning; that value is in the git history, so it should be rotated.
+**OAuth client.** API-key logins use the built-in OAuth client. If it ever changes, set `WORKADEMY_OAUTH_CLIENT_ID`
+and `WORKADEMY_OAUTH_CLIENT_SECRET` (or a base64 `WORKADEMY_OAUTH_CLIENT_BASIC`).
 
 Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSVs, default: the system temp folder).
 
@@ -203,7 +201,7 @@ core API and says so in `warnings`.
 
 `npm run build && npm run test:smoke` starts two mock workspaces and drives the built server over MCP:
 routing, read-only protection, token refresh, analytics paths, the monthly report (with and without
-analytics access), exports and the legacy single-key setup.
+analytics access), exports, the legacy single-key setup and `npm run keys`.
 
 ## Available Tools
 

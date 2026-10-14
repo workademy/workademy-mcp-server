@@ -1,10 +1,12 @@
 import * as fs from "fs";
+import * as path from "path";
+import { fileURLToPath } from "url";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-// Kept only so existing setups keep working. Set WORKADEMY_OAUTH_CLIENT_ID and
-// WORKADEMY_OAUTH_CLIENT_SECRET (or WORKADEMY_OAUTH_CLIENT_BASIC), rotate the secret,
-// then delete this constant.
-const LEGACY_CLIENT_BASIC = "c3lzdGVtOkViNFRRaXpEdFlpYndJTHI=";
-let legacyWarningShown = false;
+/** workspaces.json in the project folder (next to package.json) is picked up without any env setting. */
+export const DEFAULT_WORKSPACES_FILE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "workspaces.json");
+// Built-in OAuth client used for API-key logins. Override with WORKADEMY_OAUTH_CLIENT_ID and
+// WORKADEMY_OAUTH_CLIENT_SECRET (or WORKADEMY_OAUTH_CLIENT_BASIC) if it ever changes.
+const DEFAULT_CLIENT_BASIC = "c3lzdGVtOkViNFRRaXpEdFlpYndJTHI=";
 /** Base64 "client_id:client_secret" used as Basic auth on /oauth/token. */
 export function oauthClientBasic(env = process.env) {
     if (env.WORKADEMY_OAUTH_CLIENT_BASIC) {
@@ -13,12 +15,7 @@ export function oauthClientBasic(env = process.env) {
     if (env.WORKADEMY_OAUTH_CLIENT_ID && env.WORKADEMY_OAUTH_CLIENT_SECRET) {
         return Buffer.from(`${env.WORKADEMY_OAUTH_CLIENT_ID}:${env.WORKADEMY_OAUTH_CLIENT_SECRET}`).toString("base64");
     }
-    if (!legacyWarningShown) {
-        legacyWarningShown = true;
-        console.error("[workademy-mcp] WARNING: using the built-in legacy OAuth client credentials. " +
-            "Set WORKADEMY_OAUTH_CLIENT_ID and WORKADEMY_OAUTH_CLIENT_SECRET instead.");
-    }
-    return LEGACY_CLIENT_BASIC;
+    return DEFAULT_CLIENT_BASIC;
 }
 function normalizeBaseUrl(entry, alias) {
     let url = entry.baseUrl?.trim();
@@ -46,14 +43,18 @@ export class WorkspaceRegistry {
         this.defaultAlias = defaultAlias;
     }
     /**
-     * Loads workspaces from WORKADEMY_WORKSPACES_FILE when set.
+     * Loads workspaces from WORKADEMY_WORKSPACES_FILE, or from workspaces.json in the project folder.
      * Otherwise falls back to the original single-workspace env setup
      * (WORKADEMY_API_KEY + WORKADEMY_BASE_URL), exposed under the alias "default".
+     * WORKADEMY_WORKSPACES_FILE=none forces the single-workspace setup.
      */
     static load(env = process.env) {
         const file = env.WORKADEMY_WORKSPACES_FILE;
-        if (file) {
+        if (file && file !== "none") {
             return WorkspaceRegistry.fromFile(file, env);
+        }
+        if (file !== "none" && fs.existsSync(DEFAULT_WORKSPACES_FILE)) {
+            return WorkspaceRegistry.fromFile(DEFAULT_WORKSPACES_FILE, env);
         }
         return WorkspaceRegistry.fromLegacyEnv(env);
     }
@@ -69,8 +70,20 @@ export class WorkspaceRegistry {
         if (entries.length === 0) {
             throw new McpError(ErrorCode.InvalidRequest, `No workspaces defined in ${file}`);
         }
+        // Keys live in a separate file (never in workspaces.json itself, so that one can be shared and edited)
+        const keysPath = path.resolve(path.dirname(file), parsed.keysFile ?? "workspaces.keys.json");
+        let keys = {};
+        if (fs.existsSync(keysPath)) {
+            try {
+                keys = JSON.parse(fs.readFileSync(keysPath, "utf8"));
+            }
+            catch (error) {
+                throw new McpError(ErrorCode.InvalidRequest, `Could not read keys file ${keysPath}: ${error.message}`);
+            }
+        }
         const workspaces = entries.map(([alias, entry]) => {
-            const apiKey = entry.apiKeyEnv ? env[entry.apiKeyEnv] ?? "" : entry.apiKey ?? "";
+            // Order: environment variable, keys file, inline apiKey
+            const apiKey = (entry.apiKeyEnv ? env[entry.apiKeyEnv] : undefined) || keys[alias] || entry.apiKey || "";
             return {
                 alias,
                 id: entry.id,
