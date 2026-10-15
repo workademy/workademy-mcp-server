@@ -1,8 +1,10 @@
 /**
- * npm run reports -- [--month 2026-09] [--only edera,se-ranking] [--all] [--out <folder>]
+ * npm run reports -- [--month 2026-09] [--only edera,se-ranking] [--all] [--pause 60] [--rate 1] [--summary] [--out <folder>]
  *
  * Makes the monthly client PDFs for every workspace in workspaces.json (except "report": { "skip": true })
- * and writes reports/<month>/summary.md: who gets the report, who gets the win-back email, what failed.
+ * and writes reports/<month>/summary.md: who gets the report, who gets the win-back email, what failed,
+ * what has not run yet. The summary is rebuilt from the data saved in the month's folder after every
+ * workspace (and on Ctrl+C), so a run can be stopped and continued with --only.
  */
 import { existsSync, readFileSync, realpathSync } from "fs";
 import * as fs from "fs/promises";
@@ -18,13 +20,10 @@ import {
   sendDecision,
   type MonthlyPdfResult,
 } from "./monthly-pdf.js";
-import { REPO_ROOT, launchBrowser } from "./report-pdf.js";
+import { REPO_ROOT, buildPageModel, countPdfPages, languageFor, launchBrowser, pdfFileName } from "./report-pdf.js";
+import { sleep } from "./pacing.js";
 
 process.env.WORKADEMY_MCP_NO_SERVER = "1";
-// The firewall in front of the API blocks an IP for a few minutes after a burst (see pacing.ts):
-// about 4 requests a second, and wait out a block for up to 10 minutes.
-process.env.WORKADEMY_MIN_REQUEST_GAP_MS ??= "250";
-process.env.WORKADEMY_RATE_LIMIT_WAIT_MS ??= "600000";
 const { WorkademyClient } = await import("./index.js");
 
 const HELP = `Monthly client reports as PDFs.
@@ -33,8 +32,14 @@ const HELP = `Monthly client reports as PDFs.
 
   --month YYYY-MM   month to report (default: the previous full month)
   --only a,b        only these workspaces (alias, host, name or id)
-  --all             also make PDFs for quiet months (below the completions threshold)
+  --all             also make PDFs for quiet months (below the thresholds)
+  --pause <seconds> pause between workspaces (default 60)
+  --rate <n>        requests per second (default 1)
+  --summary         only rebuild summary.md from the data already saved (no calls to Workademy)
   --out <folder>    where to write (default: reports/ in this folder)
+
+Workademy's firewall blocks a computer for a while after too many requests, so the run is slow on
+purpose. If it is blocked anyway, it stops; the summary lists what is left and the command to continue.
 
 Per-workspace settings go in workspaces.json, e.g.
   "edera": { ..., "report": { "client": "EdEra", "language": "uk" } }
@@ -42,7 +47,16 @@ Per-workspace settings go in workspaces.json, e.g.
 `;
 
 function parseArgs(argv: string[]) {
-  const opts: { month?: string; only?: string[]; all: boolean; out?: string; help: boolean } = { all: false, help: false };
+  const opts: {
+    month?: string;
+    only?: string[];
+    all: boolean;
+    out?: string;
+    pause?: number;
+    rate?: number;
+    summary: boolean;
+    help: boolean;
+  } = { all: false, summary: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const value = () => {
@@ -50,10 +64,18 @@ function parseArgs(argv: string[]) {
       if (!v) throw new Error(`${arg} needs a value`);
       return v;
     };
+    const number = (name: string, v: string, min: number) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < min) throw new Error(`${name} must be a number of at least ${min}`);
+      return n;
+    };
     if (arg === "--help" || arg === "-h") opts.help = true;
     else if (arg.startsWith("--month")) opts.month = value();
     else if (arg.startsWith("--only")) opts.only = value().split(",").map((s) => s.trim()).filter(Boolean);
     else if (arg === "--all") opts.all = true;
+    else if (arg === "--summary") opts.summary = true;
+    else if (arg.startsWith("--pause")) opts.pause = number("--pause", value(), 0);
+    else if (arg.startsWith("--rate")) opts.rate = number("--rate", value(), 0.05);
     else if (arg.startsWith("--out")) opts.out = value();
     else throw new Error(`Unknown option ${arg} (see --help)`);
   }
@@ -113,7 +135,79 @@ type Row =
   | { kind: "report"; workspace: string; result: MonthlyPdfResult }
   | { kind: "winback"; workspace: string; client: string; reason: string; result?: MonthlyPdfResult }
   | { kind: "skipped"; workspace: string; reason: string }
-  | { kind: "error"; workspace: string; error: string };
+  | { kind: "error"; workspace: string; error: string }
+  | { kind: "notrun"; workspace: string; reason: string };
+
+const dataFile = (month: string, alias: string) =>
+  path.join(reportsDir(month), `${alias.replace(/[^A-Za-z0-9_-]+/g, "-")}.report.json`);
+
+/** The row for a workspace from what an earlier run saved (no calls to Workademy). */
+async function rowFromFiles(workspace: WorkspaceConfig, month: string): Promise<Row | null> {
+  const alias = workspace.alias;
+  const file = dataFile(month, alias);
+  if (!existsSync(file)) return null;
+  let report: any;
+  try {
+    report = JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    return { kind: "error", workspace: alias, error: `the saved data (${path.basename(file)}) cannot be read: run again with --only ${alias}` };
+  }
+  const problem = reportProblem(report, alias);
+  if (problem) return { kind: "error", workspace: alias, error: problem };
+  const settings = workspace.report;
+  const decision = sendDecision(report, settings);
+  const client = settings?.client || workspace.name || report.workspace?.name || alias;
+  if (!decision.send) return { kind: "winback", workspace: alias, client, reason: decision.reason };
+  const pdfPath = path.join(reportsDir(month), pdfFileName(client, month, alias));
+  if (!existsSync(pdfPath)) {
+    return { kind: "error", workspace: alias, error: `the numbers are saved but the PDF is missing: run again with --only ${alias}` };
+  }
+  const language = languageFor(settings, report.workspace?.locale);
+  const model = buildPageModel(report, { language, client, headline: settings?.headline });
+  const pages = countPdfPages(await fs.readFile(pdfPath));
+  const h = report.headline ?? {};
+  return {
+    kind: "report",
+    workspace: alias,
+    result: {
+      workspace: alias,
+      client,
+      month,
+      language,
+      pdfPath,
+      pages,
+      fitsOnePage: pages === 1,
+      layoutStep: -1,
+      headline: model.headline,
+      headlineKind: model.headlineKind,
+      sendRecommendation: decision,
+      numbers: {
+        newEnrollments: h.newEnrollmentsThisMonth ?? null,
+        completions: h.completionsThisMonth ?? null,
+        certificates: h.certificatesThisMonth ?? null,
+        activeLearners: h.activeUsers ?? null,
+        previousMonth: report.previousMonth ?? null,
+      },
+      warnings: report.warnings ?? [],
+    },
+  };
+}
+
+/** Every configured workspace: this run's result, else what an earlier run saved, else "not run yet". */
+async function summaryRows(all: WorkspaceConfig[], month: string, thisRun: Map<string, Row>): Promise<Row[]> {
+  const rows: Row[] = [];
+  for (const workspace of all) {
+    const alias = workspace.alias;
+    const row =
+      thisRun.get(alias) ??
+      (workspace.report?.skip
+        ? ({ kind: "skipped", workspace: alias, reason: '"skip": true in workspaces.json' } as Row)
+        : await rowFromFiles(workspace, month)) ??
+      ({ kind: "notrun", workspace: alias, reason: "not run yet for this month" } as Row);
+    rows.push(row);
+  }
+  return rows;
+}
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -124,6 +218,11 @@ async function main() {
   const month = opts.month ?? previousMonth();
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw new Error(`--month must look like 2026-09`);
   if (opts.out) process.env.WORKADEMY_REPORTS_DIR = path.resolve(opts.out);
+  // Slow on purpose: the firewall in front of the API blocks a computer after too many requests (pacing.ts).
+  if (opts.rate) process.env.WORKADEMY_MIN_REQUEST_GAP_MS = String(Math.round(1000 / opts.rate));
+  process.env.WORKADEMY_MIN_REQUEST_GAP_MS ??= "1000";
+  process.env.WORKADEMY_RATE_LIMIT_WAIT_MS ??= "300000";
+  const pauseMs = (opts.pause ?? 60) * 1000;
 
   let registry = WorkspaceRegistry.load();
   const unset = registry.workspaces.filter((w) => !w.apiKey && w.apiKeyEnv).map((w) => w.apiKeyEnv!);
@@ -134,77 +233,116 @@ async function main() {
       registry = WorkspaceRegistry.load();
     }
   }
-  let workspaces: WorkspaceConfig[] = registry.workspaces;
-  if (opts.only) workspaces = opts.only.map((selector) => registry.resolve(selector));
-
-  const rows: Row[] = [];
-  let browser: Awaited<ReturnType<typeof launchBrowser>> | null = null;
-  try {
-    for (const workspace of workspaces) {
-      const label = workspace.alias;
-      if (workspace.report?.skip && !opts.only) {
-        rows.push({ kind: "skipped", workspace: label, reason: '"skip": true in workspaces.json' });
-        console.log(`- ${label}: skipped`);
-        continue;
-      }
-      if (!workspace.apiKey) {
-        rows.push({ kind: "error", workspace: label, error: `no API key (run npm run keys${workspace.apiKeyEnv ? ` or set ${workspace.apiKeyEnv}` : ""})` });
-        console.log(`✗ ${label}: no API key`);
-        continue;
-      }
-      process.stdout.write(`… ${label}: report for ${month}`);
-      try {
-        const client = new WorkademyClient({
-          baseUrl: workspace.baseUrl,
-          apiKey: workspace.apiKey,
-          clientBasic: oauthClientBasic(),
-          workspaceId: workspace.id,
-        });
-        const ctx = { client, workspace, registry };
-        // no 60 s bridge limit here: large workspaces and firewall pauses get the time they need
-        const report: any = await monthlyReport(ctx, { month, includeDepartments: false, budgetMs: 900_000 });
-        // no numbers at all (refused key, workspace gone) is a failure, not a quiet month
-        const problem = reportProblem(report, label);
-        if (problem) {
-          rows.push({ kind: "error", workspace: label, error: problem });
-          console.log(`\r✗ ${label}: ${problem}`);
-          continue;
-        }
-        const decision = sendDecision(report, workspace.report);
-        const clientName = workspace.report?.client || workspace.name || report.workspace?.name || label;
-        if (!decision.send && !opts.all) {
-          await saveReportData(label, report);
-          rows.push({ kind: "winback", workspace: label, client: clientName, reason: decision.reason });
-          console.log(`\r→ ${label}: win-back (${decision.reason})`);
-          continue;
-        }
-        browser ??= await launchBrowser();
-        const result = await createMonthlyPdf(ctx, { month }, { browser, report });
-        rows.push(
-          decision.send
-            ? { kind: "report", workspace: label, result }
-            : { kind: "winback", workspace: label, client: clientName, reason: decision.reason, result }
-        );
-        console.log(`\r✓ ${label}: ${path.relative(process.cwd(), result.pdfPath)}${result.fitsOnePage ? "" : "  (CHECK: did not fit one page)"}`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        rows.push({ kind: "error", workspace: label, error: message });
-        console.log(`\r✗ ${label}: ${message}`);
-      }
-    }
-  } finally {
-    await browser?.close().catch(() => undefined);
-  }
+  const all = registry.workspaces;
+  const selected: WorkspaceConfig[] = opts.only ? opts.only.map((selector) => registry.resolve(selector)) : all;
 
   const dir = reportsDir(month);
   await fs.mkdir(dir, { recursive: true });
-  const md = summaryMarkdown(month, rows);
-  await fs.writeFile(path.join(dir, "summary.md"), md);
-  await fs.writeFile(path.join(dir, "summary.json"), JSON.stringify({ month, createdAt: new Date().toISOString(), rows }, null, 2));
+  const thisRun = new Map<string, Row>();
+  const writeSummary = async () => {
+    const rows = await summaryRows(all, month, thisRun);
+    await fs.writeFile(path.join(dir, "summary.md"), summaryMarkdown(month, rows));
+    await fs.writeFile(path.join(dir, "summary.json"), JSON.stringify({ month, updatedAt: new Date().toISOString(), rows }, null, 2));
+    return rows;
+  };
+  let interrupted = false;
+  process.on("SIGINT", () => {
+    if (interrupted) process.exit(130);
+    interrupted = true;
+    console.log("\nStopped. Writing the summary…");
+    writeSummary()
+      .then(() => console.log(`Summary: ${path.relative(process.cwd(), path.join(dir, "summary.md"))}`))
+      .finally(() => process.exit(130));
+  });
+
+  if (!opts.summary) {
+    let browser: Awaited<ReturnType<typeof launchBrowser>> | null = null;
+    let stoppedBy: string | null = null;
+    let started = 0;
+    try {
+      for (const workspace of selected) {
+        const label = workspace.alias;
+        if (stoppedBy) {
+          thisRun.set(label, { kind: "notrun", workspace: label, reason: stoppedBy });
+          continue;
+        }
+        if (workspace.report?.skip && !opts.only) {
+          thisRun.set(label, { kind: "skipped", workspace: label, reason: '"skip": true in workspaces.json' });
+          console.log(`- ${label}: skipped`);
+          continue;
+        }
+        if (!workspace.apiKey) {
+          thisRun.set(label, {
+            kind: "error",
+            workspace: label,
+            error: `no API key (run npm run keys${workspace.apiKeyEnv ? ` or set ${workspace.apiKeyEnv}` : ""})`,
+          });
+          console.log(`✗ ${label}: no API key`);
+          continue;
+        }
+        if (started > 0 && pauseMs > 0) {
+          console.log(`  (pause of ${Math.round(pauseMs / 1000)} s, so the firewall does not block us)`);
+          await sleep(pauseMs);
+        }
+        started += 1;
+        process.stdout.write(`… ${label}: report for ${month}`);
+        let row: Row;
+        try {
+          const client = new WorkademyClient({
+            baseUrl: workspace.baseUrl,
+            apiKey: workspace.apiKey,
+            clientBasic: oauthClientBasic(),
+            workspaceId: workspace.id,
+          });
+          const ctx = { client, workspace, registry };
+          // no 60 s bridge limit here: large workspaces and firewall pauses get the time they need
+          const report: any = await monthlyReport(ctx, { month, includeDepartments: false, budgetMs: 900_000 });
+          // missing or incomplete numbers are a failure, never a quiet month
+          const problem = reportProblem(report, label);
+          if (problem) {
+            row = { kind: "error", workspace: label, error: problem };
+          } else {
+            const decision = sendDecision(report, workspace.report);
+            const clientName = workspace.report?.client || workspace.name || report.workspace?.name || label;
+            if (!decision.send && !opts.all) {
+              await saveReportData(label, report);
+              row = { kind: "winback", workspace: label, client: clientName, reason: decision.reason };
+            } else {
+              browser ??= await launchBrowser();
+              const result = await createMonthlyPdf(ctx, { month }, { browser, report });
+              row = decision.send
+                ? { kind: "report", workspace: label, result }
+                : { kind: "winback", workspace: label, client: clientName, reason: decision.reason, result };
+            }
+          }
+        } catch (error) {
+          row = { kind: "error", workspace: label, error: error instanceof Error ? error.message : String(error) };
+        }
+        thisRun.set(label, row);
+        if (row.kind === "report") {
+          console.log(`\r✓ ${label}: ${path.relative(process.cwd(), row.result.pdfPath)}${row.result.fitsOnePage ? "" : "  (CHECK: did not fit one page)"}`);
+        } else if (row.kind === "winback") {
+          console.log(`\r→ ${label}: win-back (${row.reason})`);
+        } else if (row.kind === "error") {
+          console.log(`\r✗ ${label}: ${row.error}`);
+          // blocked even after waiting: more requests would only keep the block going
+          if (row.error.includes("firewall")) {
+            stoppedBy = `not run: the run stopped when Workademy's firewall blocked ${label}`;
+            console.log("  Stopping here; the rest can run later (see the summary).");
+          }
+        }
+        await writeSummary();
+      }
+    } finally {
+      await browser?.close().catch(() => undefined);
+    }
+  }
+
+  const rows = await writeSummary();
   console.log(`\nSummary: ${path.relative(process.cwd(), path.join(dir, "summary.md"))}`);
-  const failed = rows.filter((r) => r.kind === "error").map((r) => r.workspace);
-  if (failed.length) {
-    console.log(`Run again for the ${failed.length} that failed: ${rerunCommand(month, failed)}`);
+  const todo = rows.filter((r) => r.kind === "error" || r.kind === "notrun").map((r) => r.workspace);
+  if (todo.length) {
+    console.log(`Still to do (${todo.length}): ${rerunCommand(month, todo)}`);
     process.exitCode = 1;
   }
 }
@@ -234,7 +372,14 @@ function summaryMarkdown(month: string, rows: Row[]): string {
   if (errors.length) {
     lines.push("", `## Failed (${errors.length})`, "");
     for (const r of errors) lines.push(`- ${r.workspace}: ${r.error}`);
-    lines.push("", "Run again for these:", "", "```", rerunCommand(month, errors.map((r) => r.workspace)), "```");
+  }
+  const notrun = rows.filter((r): r is Extract<Row, { kind: "notrun" }> => r.kind === "notrun");
+  if (notrun.length) {
+    lines.push("", `## Not run yet (${notrun.length})`, "");
+    for (const r of notrun) lines.push(`- ${r.workspace}: ${r.reason}`);
+  }
+  if (errors.length || notrun.length) {
+    lines.push("", "Run these next:", "", "```", rerunCommand(month, [...errors, ...notrun].map((r) => r.workspace)), "```");
   }
   const skipped = rows.filter((r): r is Extract<Row, { kind: "skipped" }> => r.kind === "skipped");
   if (skipped.length) lines.push("", `Skipped: ${skipped.map((r) => r.workspace).join(", ")}`);

@@ -30,7 +30,8 @@ export function reportProblem(report, alias) {
     const h = report?.headline ?? {};
     const warnings = report?.warnings ?? [];
     // a block in the middle of a report leaves numbers that are too low: never use them
-    if (warnings.some((w) => w.includes("firewall"))) {
+    // (files from before 15 Oct 02:00 name the firewall's 403 only as "Request failed with status code 403")
+    if (warnings.some((w) => w.includes("firewall") || /\b403 Request failed with status code 403\b/.test(w))) {
         return ("Workademy's firewall limited requests from this computer, so the numbers are incomplete. " +
             `Wait a few minutes, then run again with --only ${alias}.`);
     }

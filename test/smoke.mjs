@@ -499,7 +499,7 @@ await check("makes the PDFs, sends quiet accounts to win-back, reports failures,
   const out = path.join(runDir, "out");
   let stdout = "";
   try {
-    ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", out], {
+    ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--pause", "0", "--out", out], {
       env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", KEY_CLIENT: "key-b", KEY_REFUSED: "not-a-key", WORKADEMY_ASSET_CDN: a.url, WORKADEMY_MIN_REQUEST_GAP_MS: "20" },
       encoding: "utf8",
     }));
@@ -539,7 +539,7 @@ await check("firewall block (403 page): the run waits it out; without waiting it
   fs.writeFileSync(file, JSON.stringify({ workspaces: { edera: { id: 10, name: "EdEra", baseUrl: a.url, apiKeyEnv: "KEY_EDERA", report: { minCompletions: 1e6, minEnrollments: 1e6 } } } }));
   const run = async (env) => {
     try {
-      await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", path.join(runDir, "out")], {
+      await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--pause", "0", "--out", path.join(runDir, "out")], {
         env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a", WORKADEMY_ASSET_CDN: a.url, WORKADEMY_MIN_REQUEST_GAP_MS: "0", ...env },
         encoding: "utf8",
       });
@@ -556,6 +556,37 @@ await check("firewall block (403 page): the run waits it out; without waiting it
   const failed = await run({ WORKADEMY_RATE_LIMIT_WAIT_MS: "0" });
   assert.equal(failed.kind, "error");
   assert.match(failed.error, /^Workademy's firewall limited requests from this computer[^]*--only edera\.$/);
+
+  // --summary rebuilds the picture from the saved data, without a single call to Workademy
+  const before = a.state.log.length;
+  await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--summary", "--out", path.join(runDir, "out")], {
+    env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, KEY_EDERA: "key-a" },
+    encoding: "utf8",
+  });
+  assert.equal(a.state.log.length, before, "no requests");
+  const rebuilt = JSON.parse(fs.readFileSync(path.join(runDir, "out", "2026-09", "summary.json"), "utf8")).rows[0];
+  assert.equal(rebuilt.kind, "winback", "the good numbers of the first run are still the month's result");
+
+  // blocked with no waiting allowed: the run stops instead of sending more requests
+  const two = path.join(runDir, "two.json");
+  const entry = { id: 10, baseUrl: a.url, apiKeyEnv: "KEY_EDERA", report: { minCompletions: 1e6, minEnrollments: 1e6 } };
+  fs.writeFileSync(two, JSON.stringify({ workspaces: { first: { ...entry, name: "First" }, second: { ...entry, name: "Second" } } }));
+  await fetch(`${a.url}/__control/waf?after=0&ms=60000`);
+  let out = "";
+  try {
+    await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--pause", "0", "--out", path.join(runDir, "out2")], {
+      env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: two, KEY_EDERA: "key-a", WORKADEMY_MIN_REQUEST_GAP_MS: "0", WORKADEMY_RATE_LIMIT_WAIT_MS: "0" },
+      encoding: "utf8",
+    });
+  } catch (error) {
+    out = error.stdout ?? "";
+  }
+  const stopped = JSON.parse(fs.readFileSync(path.join(runDir, "out2", "2026-09", "summary.json"), "utf8")).rows;
+  assert.deepEqual(stopped.map((r) => [r.workspace, r.kind]), [["first", "error"], ["second", "notrun"]], out);
+  assert.match(stopped[1].reason, /stopped when Workademy's firewall blocked first/);
+  assert.match(out, /Still to do \(2\): npm run reports -- --month 2026-09 --only first,second/);
+  const md = fs.readFileSync(path.join(runDir, "out2", "2026-09", "summary.md"), "utf8");
+  assert.match(md, /## Not run yet \(1\)\n\n- second:/);
   assert.ok(!fs.existsSync(path.join(runDir, "out", "2026-09", "edera.report.json")) || JSON.parse(fs.readFileSync(path.join(runDir, "out", "2026-09", "edera.report.json"), "utf8")).warnings.length === 0, "incomplete numbers are not kept as the month's data");
   await fetch(`${a.url}/__control/waf?after=0&ms=0`); // firewall off again
 });
@@ -577,7 +608,7 @@ await check("npm run reports takes a key that only the Claude app's config holds
   );
   let stdout = "";
   try {
-    ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--out", path.join(dir, "out")], {
+    ({ stdout } = await promisify(execFile)(process.execPath, [path.join(here, "..", "dist", "cli-reports.js"), "--month", "2026-09", "--pause", "0", "--out", path.join(dir, "out")], {
       env: { ...baseEnv, WORKADEMY_WORKSPACES_FILE: file, WORKADEMY_CLAUDE_CONFIG: claudeConfig, WORKADEMY_ASSET_CDN: a.url, WORKADEMY_MIN_REQUEST_GAP_MS: "0" },
       encoding: "utf8",
     }));
