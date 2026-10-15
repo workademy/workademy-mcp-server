@@ -24,7 +24,7 @@ const HELP = `Monthly client reports as PDFs.
   --month YYYY-MM   month to report (default: the previous full month)
   --only a,b        only these workspaces (alias, host, name or id)
   --all             also make PDFs for quiet months (below the thresholds)
-  --pause <seconds> pause between workspaces (default 60)
+  --pause <seconds> pause between workspaces (default 20)
   --rate <n>        requests per second (default 1)
   --summary         only rebuild summary.md from the data already saved (no calls to Workademy)
   --out <folder>    where to write (default: reports/ in this folder)
@@ -210,7 +210,7 @@ async function main() {
         process.env.WORKADEMY_MIN_REQUEST_GAP_MS = String(Math.round(1000 / opts.rate));
     process.env.WORKADEMY_MIN_REQUEST_GAP_MS ??= "1000";
     process.env.WORKADEMY_RATE_LIMIT_WAIT_MS ??= "300000";
-    const pauseMs = (opts.pause ?? 60) * 1000;
+    const pauseMs = (opts.pause ?? 20) * 1000;
     let registry = WorkspaceRegistry.load();
     const unset = registry.workspaces.filter((w) => !w.apiKey && w.apiKeyEnv).map((w) => w.apiKeyEnv);
     if (unset.length) {

@@ -169,6 +169,8 @@ export async function startMock({
       return { id: 1, username: `WORKSPACE_ID_${workspaceId}@system.example`, roles: [{ name: "ROLE_ADMIN" }] };
     if (method === "GET" && path === "/api/v1/secured/courses") return page(courses, query);
     if (method === "GET" && (m = path.match(/^\/api\/v1\/secured\/courses\/(\d+)\/usercourses$/))) {
+      if (state.forbiddenCourse === m[1])
+        return { __status: 403, __body: { reason: `Forbidden: User cannot access this course. Course Id: ${m[1]}`, code: 2100, extra: {} } };
       const rows = byCourse[m[1]] ?? [];
       return page(query.get("q") === "finishTime=isnot=null" ? rows.filter((u) => u.finishTime) : rows, query);
     }
@@ -216,7 +218,8 @@ export async function startMock({
       const auth = req.headers.authorization ?? "";
       state.log.push({ method: req.method, path, query: url.search });
       const send = (status, payload, type = "application/json") => {
-        res.writeHead(status, { "Content-Type": type });
+        // like production: CloudFront marks every error response this way, firewall or not
+        res.writeHead(status, { "Content-Type": type, ...(status >= 400 ? { "X-Cache": "Error from cloudfront" } : {}) });
         res.end(payload === undefined || payload === null ? "" : type === "application/json" ? JSON.stringify(payload) : payload);
       };
 
@@ -233,6 +236,11 @@ export async function startMock({
         return send(200, { ok: true });
       }
       // like CloudFront's firewall: after `after` more requests, block everything for `ms` with an HTML 403
+      // a course shared from another workspace whose enrolments this key may not read (Child Rescue, Oct 2026)
+      if (path === "/__control/forbiddenCourse") {
+        state.forbiddenCourse = url.searchParams.get("id");
+        return send(200, { ok: true });
+      }
       if (path === "/__control/keyconflict") {
         state.keyConflict = url.searchParams.get("on") !== "0";
         return send(200, { ok: true });
@@ -305,7 +313,7 @@ export async function startMock({
       }
       const result = coreRoute(req.method, path, url.searchParams, state.userTokens.has(token), parsedBody);
       if (result === undefined) return send(404, { message: `mock: no route for ${req.method} ${path}` });
-      if (result && result.__status) return send(result.__status, { message: result.message });
+      if (result && result.__status) return send(result.__status, result.__body ?? { message: result.message });
       return result === null ? send(204, null) : send(200, result);
     });
   });

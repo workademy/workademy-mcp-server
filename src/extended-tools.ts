@@ -208,7 +208,7 @@ function messageOf(error: unknown): string {
   }
   if (axios.isAxiosError(error)) {
     const data: any = error.response?.data;
-    const detail = data?.message ?? data?.error_description ?? data?.error ?? error.message;
+    const detail = data?.message ?? data?.error_description ?? data?.reason ?? data?.error ?? error.message;
     return `${error.response?.status ?? ""} ${detail}`.trim();
   }
   return error instanceof Error ? error.message : String(error);
@@ -1177,23 +1177,46 @@ export async function monthlyReport(ctx: ToolContext, args: Record<string, any>)
   let recordsToDate: { enrolled: number; finished: number } | null = null;
   if (sources.enrollments === "analytics API" && num(courseCount) > 0 && num(courseCount) <= 100 && timeLeft()) {
     const list = await safe("courses", warnings, () => fetchAllPages<any>(client, "/api/v1/secured/courses"));
+    // A course shared from another workspace can refuse its enrolments to this key
+    // (403 {"reason":"Forbidden: User cannot access this course…","code":2100}, Child Rescue, Oct 2026):
+    // count it from analytics instead of giving up on the records.
     const counted = list
       ? await mapLimit(list.items, 6, (course) =>
-          safe(`course ${course.id} totals`, warnings, async () => ({
-            id: course.id as number,
-            name: stripHtml(course.name),
-            enrolled: await countOf(client, `/api/v1/secured/courses/${course.id}/usercourses`),
-            finished: await countOf(client, `/api/v1/secured/courses/${course.id}/usercourses`, {
-              q: "finishTime=isnot=null",
-            }),
-          }))
+          safe(`course ${course.id} totals`, warnings, async () => {
+            const id = course.id as number;
+            const name = stripHtml(course.name);
+            try {
+              return {
+                id,
+                name,
+                enrolled: await countOf(client, `/api/v1/secured/courses/${id}/usercourses`) as number | null,
+                finished: await countOf(client, `/api/v1/secured/courses/${id}/usercourses`, {
+                  q: "finishTime=isnot=null",
+                }) as number | null,
+              };
+            } catch (error) {
+              if (statusOf(error) === 403 && !isRateLimited(error)) return { id, name, enrolled: null, finished: null };
+              throw error;
+            }
+          })
         )
       : [];
     if (list && counted.every((c) => c !== null)) {
       const byId = new Map(counted.map((c) => [c!.id, c!]));
+      let enrolledTotal = 0;
+      let finishedTotal = 0;
+      let refused = 0;
       for (const row of courses) {
         const rec = byId.get(row.courseId);
         if (!rec) continue;
+        byId.delete(row.courseId);
+        if (rec.enrolled === null || rec.finished === null) {
+          // no access to the records: keep this course's analytics numbers
+          refused += 1;
+          enrolledTotal += num(row.toDate.enrolled);
+          finishedTotal += num(row.toDate.finished);
+          continue;
+        }
         row.course = rec.name || row.course;
         courseNames.set(row.courseId, row.course);
         row.toDate = {
@@ -1202,10 +1225,17 @@ export async function monthlyReport(ctx: ToolContext, args: Record<string, any>)
           completionRate: rate(rec.finished, rec.enrolled),
           avgDaysToFinish: row.toDate.avgDaysToFinish ?? null,
         };
-        byId.delete(row.courseId);
+        enrolledTotal += rec.enrolled;
+        finishedTotal += rec.finished;
       }
       // courses with records but no analytics activity
       for (const rec of byId.values()) {
+        if (rec.enrolled === null || rec.finished === null) {
+          refused += 1;
+          continue;
+        }
+        enrolledTotal += rec.enrolled;
+        finishedTotal += rec.finished;
         if (rec.enrolled === 0) continue;
         courses.push({
           courseId: rec.id,
@@ -1214,10 +1244,12 @@ export async function monthlyReport(ctx: ToolContext, args: Record<string, any>)
           thisMonth: { enrolled: 0, finished: 0 },
         });
       }
-      recordsToDate = {
-        enrolled: counted.reduce((t, c) => t + c!.enrolled, 0),
-        finished: counted.reduce((t, c) => t + c!.finished, 0),
-      };
+      if (refused) {
+        warnings.push(
+          `${refused} shared course${refused === 1 ? "" : "s"} could not be read from the enrolment records (no access with this key); counted from analytics instead.`
+        );
+      }
+      recordsToDate = { enrolled: enrolledTotal, finished: finishedTotal };
       sources.toDate = "enrolment records (analytics history is incomplete for older courses)";
     }
   }

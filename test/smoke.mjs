@@ -267,6 +267,27 @@ await check("monthly report: this month's busiest courses, previous month, works
   assert.ok(Date.parse(r.workspace.createdAt) < Date.now() - 300 * 864e5);
 });
 
+await check("a shared course the key may not read: counted from analytics, not mistaken for the firewall", async () => {
+  await fetch(`${a.url}/__control/forbiddenCourse?id=102`);
+  try {
+    const r = await call(mcp, "get_monthly_report", { includeDepartments: false });
+    assert.deepEqual([r.headline.enrollmentsToDate, r.headline.completionsToDate], [170, 125], "records for 101 + analytics for 102");
+    assert.match(r.sources.toDate, /enrolment records/);
+    assert.ok(r.warnings.some((w) => /^1 shared course could not be read from the enrolment records/.test(w)), JSON.stringify(r.warnings));
+    const { reportProblem } = await import("../dist/monthly-pdf.js");
+    assert.equal(reportProblem(r, "edera"), null, "a complete report");
+  } finally {
+    await fetch(`${a.url}/__control/forbiddenCourse?id=0`);
+  }
+  const { isRateLimited } = await import("../dist/pacing.js");
+  const err = (status, headers, data) => ({ response: { status, headers, data } });
+  const cloudfront = { "x-cache": "Error from cloudfront" };
+  assert.equal(isRateLimited(err(403, { ...cloudfront, "content-type": "application/json" }, { reason: "Forbidden: User cannot access this course. Course Id: 258", code: 2100 })), false);
+  assert.equal(isRateLimited(err(403, { ...cloudfront, "content-type": "text/html" }, "<h1>403 ERROR</h1>Request blocked.")), true);
+  assert.equal(isRateLimited(err(429, {}, "")), true);
+  assert.equal(isRateLimited(err(403, { "content-type": "application/json" }, { reason: "Too many requests" })), true);
+});
+
 await check("one-pager wording: numbers, plurals, questions, file names, lead sentence", async () => {
   const { formatNumber, formatPercent, ukPlural, questionText, shortCourseName, languageFor, pdfFileName, buildPageModel } = pdfLib;
   assert.deepEqual([formatNumber(23910, "en"), formatNumber(23910, "de"), formatNumber(23910, "uk")], ["23,910", "23.910", "23 910"]);

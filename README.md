@@ -224,11 +224,14 @@ From Claude, `create_monthly_report_pdf` makes one client's PDF. Keys kept only 
 so `npm run reports` works in the terminal without copying them.
 
 Workademy's API sits behind a firewall that blocks a computer for a while after too many requests (a 403 web page
-instead of a JSON error). The run is therefore slow on purpose: 1 request a second (`--rate`) and a 60-second pause
+instead of a JSON error). The run is therefore slow on purpose: 1 request a second (`--rate`) and a 20-second pause
 between workspaces (`--pause`); a full run takes a while, so start it and leave it. If it is blocked anyway, it waits
 up to 5 minutes, then stops instead of sending more. The summary is rebuilt after every workspace (and on Ctrl+C)
 from the data saved in the month's folder, so it always covers every workspace: done, failed, or not run yet, with
 the command to continue (`--only …`). Missing or incomplete numbers never land on the win-back list.
+Only a 429 or the firewall's "Request blocked" page counts as a block; the API's own 403s carry a `reason`
+(shown in the summary). A course shared from another workspace that refuses its enrolments to the key
+(`code 2100`) is counted from analytics instead.
 
 Settings per workspace go in a `report` block in `workspaces.json` (all optional):
 

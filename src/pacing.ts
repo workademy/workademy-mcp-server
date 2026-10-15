@@ -31,18 +31,22 @@ export async function pace(): Promise<void> {
   if (at > now) await sleep(at - now);
 }
 
-/** A firewall block or rate limit, as opposed to a real "no permission" answer (those come as JSON). */
+/**
+ * A firewall block or rate limit, as opposed to the API's own answers. Only a 429, the firewall's
+ * "Request blocked" HTML page, or an error that says so counts. (CloudFront marks every error
+ * response "x-cache: Error from cloudfront", so that header proves nothing; and the API's own
+ * 403s are JSON, e.g. {"reason":"Forbidden: User cannot access this course…","code":2100}.)
+ */
 export function isRateLimited(error: unknown): boolean {
   const response = (error as AxiosError | undefined)?.response;
   if (!response) return false;
   if (response.status === 429) return true;
   if (response.status !== 403) return false;
   const type = String(response.headers?.["content-type"] ?? "");
-  const cache = String(response.headers?.["x-cache"] ?? "");
-  const body = typeof response.data === "string" ? response.data : "";
-  if (/error from cloudfront/i.test(cache) || /request blocked|could not be satisfied/i.test(body)) return true;
-  // the API's own 403s are JSON objects ({"error":"access_denied", ...})
-  return !/json/i.test(type) && !(response.data && typeof response.data === "object");
+  const body =
+    typeof response.data === "string" ? response.data : response.data ? JSON.stringify(response.data) : "";
+  if (/request blocked|could not be satisfied|too many requests|rate limit/i.test(body)) return true;
+  return /text\/html/i.test(type);
 }
 
 /**
