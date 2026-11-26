@@ -6,12 +6,16 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import Papa from 'papaparse';
 import os from 'os';
+import { WorkspaceRegistry, oauthClientBasic } from "./registry.js";
+import { isRateLimited, pace, waitOutBlock } from "./pacing.js";
+import { EXTENDED_TOOLS, assertToolAllowed, decorateTools, handleExtendedTool, listConfiguredWorkspaces, } from "./extended-tools.js";
 const claudeTmpDir = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'tmp');
-// Workademy API Client
-class WorkademyClient {
+// Workademy API Client (one instance per workspace)
+export class WorkademyClient {
     axiosInstance;
     config;
     tokenExpiresAt;
+    authPromise;
     constructor(config) {
         this.config = config;
         this.axiosInstance = axios.create({
@@ -20,39 +24,79 @@ class WorkademyClient {
                 "Content-Type": "application/json",
             },
         });
-        // Add response interceptor for error handling
+        // Always send the current token, also on retried requests; batch runs pace their requests
+        this.axiosInstance.interceptors.request.use(async (request) => {
+            await pace();
+            if (this.config.accessToken) {
+                request.headers.set("Authorization", `Bearer ${this.config.accessToken}`);
+            }
+            return request;
+        });
+        // On 401: get a fresh token and retry once. A second 401 goes back to the caller.
+        // On a firewall block: wait it out and retry, if this process allows waiting (see pacing.ts).
         this.axiosInstance.interceptors.response.use((response) => response, async (error) => {
-            if (error.response?.status === 401 && this.config.apiKey) {
-                // Try to refresh token
+            const original = error.config;
+            if (error.response?.status === 401 && this.config.apiKey && original && !original._retried) {
+                original._retried = true;
+                this.config.accessToken = undefined;
                 await this.authenticate();
-                // Retry original request
-                if (error.config) {
-                    return this.axiosInstance.request(error.config);
+                return this.axiosInstance.request(original);
+            }
+            if (original && isRateLimited(error)) {
+                const wait = await waitOutBlock(original._waited ?? 0);
+                if (wait.ok) {
+                    original._waited = wait.waited;
+                    return this.axiosInstance.request(original);
                 }
             }
             throw error;
         });
     }
+    get baseUrl() {
+        return this.config.baseUrl;
+    }
     async authenticate() {
         if (!this.config.apiKey) {
             throw new Error("API key required for authentication");
         }
-        const params = new URLSearchParams({
-            grant_type: "api_key",
-            api_key: this.config.apiKey,
-        });
-        // Use Basic auth with the system credentials for token request
-        const response = await axios.post(`${this.config.baseUrl}/oauth/token`, params, {
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Authorization": "Basic c3lzdGVtOkViNFRRaXpEdFlpYndJTHI=",
-            },
-        });
-        this.config.accessToken = response.data.access_token;
-        this.tokenExpiresAt = Date.now() + response.data.expires_in * 1000;
-        // Set Bearer token for subsequent API requests
-        this.axiosInstance.defaults.headers.common["Authorization"] =
-            `Bearer ${this.config.accessToken}`;
+        // Share one token request between concurrent calls
+        if (!this.authPromise) {
+            this.authPromise = (async () => {
+                const params = new URLSearchParams({
+                    grant_type: "api_key",
+                    api_key: this.config.apiKey,
+                });
+                const post = () => axios.post(`${this.config.baseUrl}/oauth/token`, params, {
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": `Basic ${this.config.clientBasic}`,
+                    },
+                });
+                // the token endpoint sits behind the same firewall
+                let waited = 0;
+                let response;
+                for (;;) {
+                    await pace();
+                    try {
+                        response = await post();
+                        break;
+                    }
+                    catch (error) {
+                        if (!isRateLimited(error))
+                            throw error;
+                        const wait = await waitOutBlock(waited);
+                        if (!wait.ok)
+                            throw error;
+                        waited = wait.waited;
+                    }
+                }
+                this.config.accessToken = response.data.access_token;
+                this.tokenExpiresAt = Date.now() + response.data.expires_in * 1000;
+            })().finally(() => {
+                this.authPromise = undefined;
+            });
+        }
+        return this.authPromise;
     }
     async ensureAuthenticated() {
         if (!this.config.accessToken) {
@@ -62,6 +106,38 @@ class WorkademyClient {
             // Refresh if token expires in less than 1 minute
             await this.authenticate();
         }
+    }
+    /** Authenticated request on this workspace's host (core API or analytics API). */
+    async request(method, path, options = {}) {
+        await this.ensureAuthenticated();
+        const response = await this.axiosInstance.request({
+            method,
+            url: path,
+            params: options.params,
+            data: options.data,
+            timeout: options.timeoutMs,
+        });
+        return response.data;
+    }
+    /** Downloads a pre-signed export file (no auth header). */
+    async download(url) {
+        const response = await axios.get(url, { responseType: "text" });
+        return response.data;
+    }
+    /** Numeric id of the workspace this API key belongs to. */
+    async getWorkspaceId() {
+        if (this.config.workspaceId !== undefined) {
+            return this.config.workspaceId;
+        }
+        const page = await this.request("GET", "/api/v1/secured/workspaces");
+        const host = new URL(this.config.baseUrl).host.toLowerCase();
+        const match = page.content.find((w) => String(w.hostname ?? "").toLowerCase() === host) ??
+            (page.content.length === 1 ? page.content[0] : undefined);
+        if (!match) {
+            throw new Error(`Could not tell which workspace ${host} is; add its "id" to the workspaces file`);
+        }
+        this.config.workspaceId = match.id;
+        return match.id;
     }
     // Course Management
     async listCourses(params) {
@@ -85,6 +161,25 @@ class WorkademyClient {
         await this.ensureAuthenticated();
         const response = await this.axiosInstance.put(`/api/v1/secured/courses/${courseId}`, courseData);
         return response.data;
+    }
+    async patchCourse(courseId, courseData) {
+        await this.ensureAuthenticated();
+        const response = await this.axiosInstance.patch(`/api/v1/secured/courses/${courseId}`, courseData);
+        return response.data;
+    }
+    /**
+     * Changes one lecture. The API has no lecture endpoint and PATCH ignores modules, so this reads the
+     * whole course, changes the one lecture and sends the whole course back (PUT needs every module).
+     */
+    async updateLecture(courseId, lectureId, changes) {
+        await this.ensureAuthenticated();
+        const current = await this.axiosInstance.get(`/api/v1/secured/courses/${courseId}`, {
+            params: { include: "modules" },
+        });
+        const course = current.data;
+        const applied = applyLectureChanges(course, lectureId, changes);
+        await this.axiosInstance.put(`/api/v1/secured/courses/${courseId}`, course);
+        return applied;
     }
     async deleteCourse(courseId) {
         await this.ensureAuthenticated();
@@ -149,6 +244,11 @@ class WorkademyClient {
     async getGroup(groupId) {
         await this.ensureAuthenticated();
         const response = await this.axiosInstance.get(`/api/v1/secured/groups/${groupId}`);
+        return response.data;
+    }
+    async listGroupUsers(groupId, params) {
+        await this.ensureAuthenticated();
+        const response = await this.axiosInstance.get(`/api/v1/secured/groups/${groupId}/users`, { params });
         return response.data;
     }
     async createGroup(groupData) {
@@ -471,35 +571,52 @@ class WorkademyClient {
 // MCP Server Setup
 const server = new Server({
     name: "workademy-mcp",
-    version: "1.0.0",
+    version: "1.2.0",
 }, {
     capabilities: {
         tools: {},
     },
 });
-// Global client instance
-let workademyClient = null;
-// Initialize client
-function getClient() {
-    if (!workademyClient) {
-        const config = {
-            baseUrl: process.env.WORKADEMY_BASE_URL || "https://staging.theworkademy.com",
-            apiKey: process.env.WORKADEMY_API_KEY,
-        };
-        if (!config.apiKey) {
-            throw new McpError(ErrorCode.InvalidRequest, "WORKADEMY_API_KEY environment variable is required");
-        }
-        if (!process.env.WORKADEMY_BASE_URL) {
-            console.warn("WORKADEMY_BASE_URL not set, using default: https://staging.theworkademy.com");
-        }
-        workademyClient = new WorkademyClient(config);
+// Workspaces and one client per workspace
+let registryCache = null;
+function getRegistry() {
+    if (!registryCache) {
+        registryCache = WorkspaceRegistry.load();
     }
-    return workademyClient;
+    return registryCache;
+}
+const clientPool = new Map();
+function getClient(workspace) {
+    let client = clientPool.get(workspace.alias);
+    if (!client) {
+        if (!workspace.apiKey) {
+            throw new McpError(ErrorCode.InvalidRequest, `No API key for workspace "${workspace.alias}". Run "npm run keys" in the workademy-mcp-server folder` +
+                (workspace.apiKeyEnv ? ` or set the environment variable ${workspace.apiKeyEnv}` : ""));
+        }
+        client = new WorkademyClient({
+            baseUrl: workspace.baseUrl,
+            apiKey: workspace.apiKey,
+            clientBasic: oauthClientBasic(),
+            workspaceId: workspace.id,
+        });
+        clientPool.set(workspace.alias, client);
+    }
+    return client;
+}
+/** Workspace aliases for the tool schemas; null if the configuration cannot be loaded yet. */
+function toolSchemaContext() {
+    try {
+        const registry = getRegistry();
+        return { defaultAlias: registry.defaultAlias, aliases: registry.aliases };
+    }
+    catch {
+        return null;
+    }
 }
 // Tool Definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
-        tools: [
+        tools: decorateTools([
             {
                 name: "analyze_pre_course_survey",
                 description: "Analyze pre-course survey results from saved CSV file. Returns statistics including response frequencies, percentages, and top answers for each question.",
@@ -605,6 +722,67 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         },
                     },
                     required: ["courseId", "courseData"],
+                },
+            },
+            {
+                name: "patch_course",
+                description: "Change course-level fields of an existing course (name, description, subtitle, settings…). " +
+                    "Send only the fields that change. Modules and lectures cannot be changed this way (the API ignores them): " +
+                    "use update_lecture for lecture content. Returns a short confirmation, not the course.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        courseId: {
+                            type: "number",
+                            description: "The ID of the course to change",
+                        },
+                        courseData: {
+                            type: "object",
+                            description: "Only the fields to change (JSON object)",
+                        },
+                    },
+                    required: ["courseId", "courseData"],
+                },
+            },
+            {
+                name: "get_course_outline",
+                description: "The modules and lectures of a course with their ids, names and how many sections and questions each has, " +
+                    "without the content. Use it to find a lecture id; get_course with modules returns the whole content and is very large.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        courseId: { type: "number", description: "The ID of the course" },
+                    },
+                    required: ["courseId"],
+                },
+            },
+            {
+                name: "get_lecture",
+                description: "One lecture of a course with its full content: fields, sections (the lecture text, HTML) and quiz questions, each with its id.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        courseId: { type: "number", description: "The ID of the course" },
+                        lectureId: { type: "number", description: "The lecture's id (from get_course_outline)" },
+                    },
+                    required: ["courseId", "lectureId"],
+                },
+            },
+            {
+                name: "update_lecture",
+                description: "Change one lecture of an existing course; the rest of the course stays as it is. " +
+                    "`changes` holds only what changes: plain fields such as name, description or mediaSource, and/or " +
+                    "`sections` and `questionAnswers` as lists of objects with the `id` of an existing section or question plus the fields to change " +
+                    "(for a section's text: {\"id\": 123, \"text\": \"<p>…</p>\"}). It changes existing sections and questions; it does not add or remove them. " +
+                    "Read the lecture with get_lecture first. Returns a short confirmation.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        courseId: { type: "number", description: "The ID of the course" },
+                        lectureId: { type: "number", description: "The lecture's id (from get_course_outline)" },
+                        changes: { type: "object", description: "Only the fields to change (JSON object)" },
+                    },
+                    required: ["courseId", "lectureId", "changes"],
                 },
             },
             {
@@ -805,6 +983,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         groupId: {
                             type: "number",
                             description: "The ID of the group to retrieve",
+                        },
+                    },
+                    required: ["groupId"],
+                },
+            },
+            {
+                name: "list_group_users",
+                description: "List the users (members) of a specific group, paginated",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        groupId: {
+                            type: "number",
+                            description: "The ID of the group",
+                        },
+                        page: {
+                            type: "number",
+                            description: "Page number (0-indexed)",
+                        },
+                        size: {
+                            type: "number",
+                            description: "Number of items per page",
                         },
                     },
                     required: ["groupId"],
@@ -1125,13 +1325,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     required: ["courseId"],
                 },
             },
-        ],
+            ...EXTENDED_TOOLS,
+        ], toolSchemaContext()),
     };
 });
 // Tool Execution Handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const client = getClient();
+    const toolName = request.params.name;
+    const { workspace: workspaceSelector, ...toolArgs } = (request.params.arguments ?? {});
+    if (toolName === "list_configured_workspaces") {
+        return listConfiguredWorkspaces(getRegistry(), getClient, toolArgs);
+    }
+    const registry = getRegistry();
+    const workspace = registry.resolve(workspaceSelector);
+    assertToolAllowed(workspace, toolName);
+    const client = getClient(workspace);
+    // The handlers below read request.params.arguments; drop the routing argument first.
+    request.params.arguments = toolArgs;
     try {
+        const extended = await handleExtendedTool(toolName, toolArgs, { client, workspace, registry });
+        if (extended) {
+            return extended;
+        }
         switch (request.params.name) {
             // Course Management
             case "list_courses": {
@@ -1178,6 +1393,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             text: JSON.stringify(result, null, 2),
                         },
                     ],
+                };
+            }
+            case "patch_course": {
+                const { courseId, courseData } = request.params.arguments;
+                if (!courseData || typeof courseData !== "object" || Object.keys(courseData).length === 0) {
+                    throw new McpError(ErrorCode.InvalidRequest, `"courseData" must be an object with at least one field to change.`);
+                }
+                if ("modules" in courseData) {
+                    throw new McpError(ErrorCode.InvalidRequest, "patch_course cannot change modules or lectures (the API ignores them without an error). Use update_lecture.");
+                }
+                const result = await client.patchCourse(courseId, courseData);
+                const summary = { courseId: result?.id ?? courseId, name: result?.name, updateTime: result?.updateTime, fields: {} };
+                for (const key of Object.keys(courseData)) {
+                    summary.fields[key] = result?.[key];
+                }
+                return {
+                    content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
+                };
+            }
+            case "get_course_outline": {
+                const { courseId } = request.params.arguments;
+                const course = await client.getCourse(courseId, "modules");
+                return {
+                    content: [{ type: "text", text: JSON.stringify(courseOutline(course), null, 2) }],
+                };
+            }
+            case "get_lecture": {
+                const { courseId, lectureId } = request.params.arguments;
+                const course = await client.getCourse(courseId, "modules");
+                const { module, lecture } = findLecture(course, lectureId);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify({ courseId: course.id, moduleId: module.id, moduleName: module.name, lecture }, null, 2),
+                        },
+                    ],
+                };
+            }
+            case "update_lecture": {
+                const { courseId, lectureId, changes } = request.params.arguments;
+                const result = await client.updateLecture(courseId, lectureId, changes);
+                return {
+                    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
                 };
             }
             case "delete_course": {
@@ -1314,6 +1573,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "get_group": {
                 const { groupId } = request.params.arguments;
                 const result = await client.getGroup(groupId);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(result, null, 2),
+                        },
+                    ],
+                };
+            }
+            case "list_group_users": {
+                const { groupId, page, size } = request.params.arguments;
+                const result = await client.listGroupUsers(groupId, { page, size });
                 return {
                     content: [
                         {
@@ -1545,21 +1816,162 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     catch (error) {
         if (error instanceof AxiosError) {
-            const errorMessage = error.response?.data?.message || error.message;
+            const errorMessage = describeApiError(error);
             const errorStatus = error.response?.status;
-            throw new McpError(ErrorCode.InternalError, `Workademy API error (${errorStatus}): ${errorMessage}`);
+            const call = `${(error.config?.method ?? "").toUpperCase()} ${error.config?.url ?? ""}`.trim();
+            throw new McpError(ErrorCode.InternalError, `Workademy API error (${errorStatus}) in workspace "${workspace.alias}" on ${call}: ${errorMessage}`);
         }
         throw error;
     }
 });
+/** Module and lecture names with their ids, without the content: what is needed to pick a lecture. */
+export function courseOutline(course) {
+    return {
+        id: course?.id,
+        name: course?.name,
+        published: course?.published,
+        modules: (course?.modules ?? []).map((module) => ({
+            id: module.id,
+            number: module.number,
+            name: module.name,
+            lectures: (module.lectures ?? []).map((lecture) => ({
+                id: lecture.id,
+                number: lecture.number,
+                name: lecture.name,
+                sections: (lecture.sections ?? []).length,
+                questions: (lecture.questionAnswers ?? []).length,
+            })),
+        })),
+    };
+}
+/** Finds a lecture in a course fetched with its modules, by its `id` or its `lectureId`. */
+export function findLecture(course, lectureId) {
+    const modules = Array.isArray(course?.modules) ? course.modules : [];
+    if (modules.length === 0) {
+        throw new McpError(ErrorCode.InvalidRequest, `Course ${course?.id} came back without modules; nothing was changed.`);
+    }
+    for (const module of modules) {
+        for (const lecture of module.lectures ?? []) {
+            if (lecture.id === lectureId || lecture.lectureId === lectureId) {
+                return { module, lecture };
+            }
+        }
+    }
+    throw new McpError(ErrorCode.InvalidRequest, `Lecture ${lectureId} is not in course ${course?.id}. Use get_course_outline to see the lecture ids.`);
+}
+const LECTURE_ID_FIELDS = new Set(["id", "lectureId", "moduleId"]);
+function mergeById(existing, changes, label, lectureId) {
+    if (!Array.isArray(changes)) {
+        throw new McpError(ErrorCode.InvalidRequest, `"${label}" must be a list of objects, each with the id of an existing entry.`);
+    }
+    const changed = [];
+    for (const change of changes) {
+        const target = existing.find((entry) => entry.id === change?.id);
+        if (!target) {
+            throw new McpError(ErrorCode.InvalidRequest, `"${label}" entry ${change?.id ?? "(no id)"} is not in lecture ${lectureId}. This tool changes existing ${label}; ` +
+                `it does not add new ones. Use get_lecture to see their ids. Nothing was changed.`);
+        }
+        for (const [key, value] of Object.entries(change)) {
+            if (key !== "id") {
+                target[key] = value;
+            }
+        }
+        changed.push(target.id);
+    }
+    return changed;
+}
+/**
+ * Applies changes to one lecture inside a full course object (in place) and says what changed.
+ * Plain fields (name, description, mediaSource, …) are replaced; `sections` and `questionAnswers`
+ * are lists of partial objects matched to the existing ones by id. Ids cannot be changed.
+ */
+export function applyLectureChanges(course, lectureId, changes) {
+    if (!changes || typeof changes !== "object" || Array.isArray(changes) || Object.keys(changes).length === 0) {
+        throw new McpError(ErrorCode.InvalidRequest, `"changes" must be an object with at least one field to change.`);
+    }
+    const { module, lecture } = findLecture(course, lectureId);
+    const changedFields = [];
+    let changedSections = [];
+    let changedQuestions = [];
+    // Check everything before touching the lecture, so a bad entry leaves it as it was.
+    const draft = JSON.parse(JSON.stringify(lecture));
+    for (const [key, value] of Object.entries(changes)) {
+        if (LECTURE_ID_FIELDS.has(key)) {
+            continue;
+        }
+        if (key === "sections") {
+            changedSections = mergeById(draft.sections ?? [], value, "sections", lecture.id);
+        }
+        else if (key === "questionAnswers") {
+            changedQuestions = mergeById(draft.questionAnswers ?? [], value, "questionAnswers", lecture.id);
+        }
+        else {
+            draft[key] = value;
+            changedFields.push(key);
+        }
+    }
+    if (changedFields.length + changedSections.length + changedQuestions.length === 0) {
+        throw new McpError(ErrorCode.InvalidRequest, `"changes" held nothing that can be changed (ids cannot be changed).`);
+    }
+    Object.assign(lecture, draft);
+    return {
+        courseId: course.id,
+        moduleId: module.id,
+        moduleName: module.name,
+        lectureId: lecture.id,
+        lectureName: lecture.name,
+        changedFields,
+        changedSections,
+        changedQuestions,
+    };
+}
+/**
+ * What the API said about a failed call: its message, reason and error code when it names them,
+ * otherwise the start of the response body, so a bare "Request failed with status code 412"
+ * is never all there is to go on.
+ */
+export function describeApiError(error) {
+    const data = error.response?.data;
+    if (data === undefined || data === null || data === "") {
+        return `${error.message} (the API sent no response body)`;
+    }
+    if (typeof data === "string") {
+        const text = data.trim();
+        if (/^<(!doctype|html)/i.test(text)) {
+            return `${error.message} (the response was a web page, not JSON)`;
+        }
+        return `${error.message}: ${text.slice(0, 500)}`;
+    }
+    const named = [data.message, data.error_description, data.reason, data.error, data.detail]
+        .filter((part) => typeof part === "string" && part.trim() !== "");
+    const code = data.code ?? data.errorCode;
+    const parts = [...new Set(named)];
+    if (code !== undefined && code !== null) {
+        parts.push(`code ${code}`);
+    }
+    if (parts.length > 0) {
+        return parts.join("; ");
+    }
+    let raw;
+    try {
+        raw = JSON.stringify(data);
+    }
+    catch {
+        raw = String(data);
+    }
+    return `${error.message}: ${raw.slice(0, 500)}`;
+}
 // Start the server
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("Workademy MCP Server running on stdio");
 }
-main().catch((error) => {
-    console.error("Fatal error in main():", error);
-    process.exit(1);
-});
+// `npm run reports` loads the API client from this file without starting the MCP server
+if (process.env.WORKADEMY_MCP_NO_SERVER !== "1") {
+    main().catch((error) => {
+        console.error("Fatal error in main():", error);
+        process.exit(1);
+    });
+}
 //# sourceMappingURL=index.js.map

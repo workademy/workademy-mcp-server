@@ -122,6 +122,186 @@ Add this to your Claude Desktop config file:
 }
 ```
 
+## Multiple workspaces
+
+A Workademy API key belongs to exactly one workspace, and the API picks the workspace from the
+hostname you call. To work with several workspaces, list them in `workspaces.json` in the project folder
+(found automatically) or point `WORKADEMY_WORKSPACES_FILE` at another file. Every tool then takes an optional `workspace` argument
+(alias, hostname or id); without it the `default` workspace is used.
+
+```json
+{
+  "default": "edera",
+  "workspaces": {
+    "edera":    { "id": 10,  "hostname": "study.ed-era.com",          "apiKeyEnv": "WORKADEMY_API_KEY", "readOnly": false },
+    "client-a": { "id": 123, "hostname": "client-a.theworkademy.com", "readOnly": true }
+  }
+}
+```
+
+- **Keys: `npm run keys`.** It asks for your Workademy login (the password is not shown), lists the workspaces your
+  account can see, creates an API key in the ones you pick (`POST /api/v1/secured/workspaces/{id}/api-key`, with a
+  comment saying who created it, so the client can see and revoke it), adds them to `workspaces.json` and stores the
+  keys in `workspaces.keys.json` (permissions 600). Neither the password nor the keys are printed.
+  Options: `--list`, `--only "Kognic, Clark"`, `--host`, `--force`. Both files are git-ignored.
+  A workspace that already has an API key answers 409 and gets no second one; it is still listed, so you only
+  need to add the existing key to `workspaces.keys.json` (or keep it in an `apiKeyEnv` variable).
+- A key can also come from an environment variable named in `apiKeyEnv`; it wins over the keys file.
+  `WORKADEMY_WORKSPACES_FILE=none` forces the old single-workspace setup.
+- **Read-only by default.** Workspaces from the file refuse tools that change data (create, update, delete,
+  enroll, complete, …) unless `"readOnly": false` is set.
+- **id** is optional; without it the server looks it up. Setting it avoids one call and allows selecting the workspace by id.
+- `list_configured_workspaces` with `verify: true` checks every key.
+
+Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "workademy": {
+      "command": "node",
+      "args": ["/absolute/path/to/workademy-mcp-server/dist/index.js"],
+      "env": {
+        "WORKADEMY_API_KEY": "… (only for entries that use apiKeyEnv)"
+      }
+    }
+  }
+}
+```
+
+The old single-workspace setup (`WORKADEMY_API_KEY` + `WORKADEMY_BASE_URL`) still works and shows up as the
+workspace `default`. Set `WORKADEMY_READ_ONLY=true` to protect it as well.
+
+**OAuth client.** API-key logins use the built-in OAuth client. If it ever changes, set `WORKADEMY_OAUTH_CLIENT_ID`
+and `WORKADEMY_OAUTH_CLIENT_SECRET` (or a base64 `WORKADEMY_OAUTH_CLIENT_BASIC`).
+
+Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSVs, default: the system temp folder), `WORKADEMY_REPORTS_DIR` (where the client PDFs go, default: `reports/` in the project folder) and `WORKADEMY_CHROME_PATH` (the browser that prints them, if Chrome is not in its usual place).
+
+## Editing an existing course
+
+The API saves a course in two ways, and they do different things:
+
+- `PATCH /courses/{id}` changes course-level fields (name, description, subtitle, settings). It ignores `modules` without an error.
+- `PUT /courses/{id}` replaces the course and needs every module in the body; without them it answers
+  `412 Precondition failed: No modules sent when updating the course (code 2106)`. There is no endpoint for a single lecture.
+
+A course with its modules is large (about 150,000 characters for 18 lectures), so the tools keep it away from the model:
+
+| Tool | What it does |
+|---|---|
+| `get_course_outline` | Modules and lectures with ids, names and the number of sections and questions; no content |
+| `get_lecture` | One lecture with its sections (the text, HTML) and quiz questions, each with its id |
+| `update_lecture` | Changes one lecture: plain fields (`name`, `description`, `mediaSource`, …) and/or `sections` and `questionAnswers` as lists of `{id, …fields to change}`. The server reads the whole course, changes that lecture and PUTs the whole course back |
+| `patch_course` | Course-level fields only; refuses a body with `modules`; returns a short confirmation |
+| `update_course` | The raw PUT: needs the complete course with its modules |
+
+`update_lecture` changes existing sections and questions; it does not add or remove lectures, sections or questions.
+It is a read-modify-write of the whole course, so a save in the web editor during those seconds can be overwritten.
+Tested on an unpublished course (name, section text, question wording: only those changed, all ids kept); not yet on a
+course with learners in progress.
+
+When a call fails, the error now carries what the API said (`message`, `reason`, `error`, `code`), or the start of the
+response body when it names none.
+
+## Client package (.mcpb)
+
+`npm run pack` builds `release/workademy-<version>.mcpb`: one file a customer installs in the Claude desktop app with a
+double-click (Claude Desktop only; it brings its own Node). The customer enters their workspace address and their API
+key (Admin Area → Integrations Management → API Key), and the server runs in the single-workspace setup.
+
+- The package holds `dist/` (without `cli-reports.js`), `assets/`, the runtime dependencies and `mcpb/manifest.json`
+  (its version comes from `package.json`). `workspaces.json`, `workspaces.keys.json`, `.env` and `reports/` never go in,
+  and the script stops if it finds one of them.
+- The customer gets every tool, with write access to their own workspace.
+- The built-in OAuth client (see "Multiple workspaces") is part of the code and therefore of the package.
+- `release/` is git-ignored. Send the file by link, not as an e-mail attachment: mail filters tend to block archives with code.
+
+## Analytics and reporting tools
+
+| Tool | What it returns |
+|---|---|
+| `list_configured_workspaces` | Configured workspaces (never the keys); `verify: true` tests each key |
+| `get_workspace_summary` | Courses (published, active, archived, new in 30 days), users, groups by HR-sync source, learning paths, invitations sent/accepted |
+| `get_analytics` | The admin-dashboard numbers from the analytics service: enrollments, certificates, lectures seen, right/wrong answers, logins, activity. Drill down course → module → lecture → question; totals or timeseries |
+| `get_course_completion` | Completion per course from enrollment records (finished, in progress, not started, inactive, expired, abandoned, avg minutes, avg quiz score); works without the analytics service |
+| `get_group_course_stats` | Completion per department (group) and course; small groups and cells hidden |
+| `export_report` | Runs a CSV export (workspace, course, group, user, learning path), waits, downloads it and returns the path. The file has named data |
+| `get_admin_todos` | Pending enrollment approvals, ungraded open answers, scheduled runs coming up |
+| `get_monthly_report` | Aggregate-only monthly report for a client one-pager: headline numbers, per-course enrollments and completions, the month's busiest courses, the previous month's totals, certificates, logins, most-missed questions, departments, upcoming runs, admin to-dos |
+| `get_workspace_branding` | The workspace's logos, theme colours and company name from its `profile.json` |
+| `create_monthly_report_pdf` | The client one-pager as a one-page A4 PDF (see below), saved in `reports/<month>/`; says whether the month is worth sending |
+
+**Privacy.** The report and stats tools return counts only — no names, e-mails or user ids. Departments with fewer
+than `minGroupSize` members (default 5), department/course cells below that size and questions with fewer answers
+are left out, so nobody can be singled out. Named data only comes from the original per-user tools and from
+`export_report` files.
+
+The analytics service (`/analytics-api/…`) is not in the public Swagger; the paths follow what the Workademy web app
+calls. If a workspace's key cannot reach it, `get_monthly_report` falls back to computing enrollments from the
+core API and says so in `warnings`.
+
+### Monthly client reports (PDF)
+
+Each client gets a one-page A4 PDF they can forward to their management: the month's numbers, the courses
+people went to, the quiz questions most people got wrong ("Where to look"), in Workademy's brand with the client's
+logo. It is made from `get_monthly_report`, so it holds counts only.
+
+```bash
+npm run reports                          # last month, every workspace in workspaces.json
+npm run reports -- --month 2026-09       # a given month
+npm run reports -- --only edera,clark    # some workspaces
+npm run reports -- --all                 # also PDFs for quiet months
+npm run reports -- --summary             # rebuild summary.md from what is saved (no calls)
+```
+
+The PDFs land in `reports/<month>/<Client>_Workademy_report_<month>.pdf` (git-ignored), with the numbers each one
+was made from (`<workspace>.report.json`, counts only) and `summary.md`:
+who gets the report, who gets the win-back email instead (fewer than 5 completions and fewer than 20 new
+enrolments in the month), and what failed.
+From Claude, `create_monthly_report_pdf` makes one client's PDF. Keys kept only in the Claude app's config
+(workspaces with `apiKeyEnv`, e.g. EdEra's `WORKADEMY_API_KEY`) are read from that config's entry for this server,
+so `npm run reports` works in the terminal without copying them.
+
+Workademy's API sits behind a firewall that blocks a computer for a while after too many requests (a 403 web page
+instead of a JSON error). The run is therefore slow on purpose: 1 request a second (`--rate`) and a 20-second pause
+between workspaces (`--pause`); a full run takes a while, so start it and leave it. If it is blocked anyway, it waits
+up to 5 minutes, then stops instead of sending more. The summary is rebuilt after every workspace (and on Ctrl+C)
+from the data saved in the month's folder, so it always covers every workspace: done, failed, or not run yet, with
+the command to continue (`--only …`). Missing or incomplete numbers never land on the win-back list.
+Only a 429 or the firewall's "Request blocked" page counts as a block; the API's own 403s carry a `reason`
+(shown in the summary). A course shared from another workspace that refuses its enrolments to the key
+(`code 2100`) is counted from analytics instead.
+
+Settings per workspace go in a `report` block in `workspaces.json` (all optional):
+
+```json
+"edera":   { "...": "...", "report": { "client": "EdEra", "language": "uk" } },
+"clark":   { "...": "...", "report": { "language": "de", "logo": "https://…/clark-logo.svg", "minCompletions": 10 } },
+"demo":    { "...": "...", "report": { "skip": true } }
+```
+
+| Setting | Default |
+|---|---|
+| `client` | the workspace name; used on the page and in the file name |
+| `language` | `en`, `de` or `uk`; default from the workspace's locale, else `en` |
+| `logo` | URL or file (relative to this folder); default: the workspace's own logo (white logos are skipped) |
+| `headline` | the lead sentence is picked from the data (strong growth on last month, one course with 40%+ of enrolments, smaller growth, or the busiest course; never a decline); set this for a hand-written one |
+| `minCompletions` | 5: completions that make the month worth a report… |
+| `minEnrollments` | 20: …or new enrolments (a client whose activity grows gets a report, not a win-back email) |
+| `skip` | leave the workspace out of `npm run reports` (internal or demo workspaces) |
+
+How it works: the page is printed by the Chrome on this computer (through `playwright-core`; no browser download).
+Fonts (Staatliches, Oswald for Cyrillic, Roboto; SIL Open Font License) and the Workademy logo are in `assets/`.
+Before printing, the page is measured; if it is too long it gets more compact step by step (tighter spacing,
+fewer table rows), and the finished PDF is checked to be exactly one page.
+
+### Testing
+
+`npm run build && npm run test:smoke` starts two mock workspaces and drives the built server over MCP:
+routing, read-only protection, token refresh, analytics paths, the monthly report (with and without
+analytics access), exports, the legacy single-key setup, `npm run keys`, the one-pager's wording and, when
+Chrome or Chromium is installed, the PDFs and `npm run reports`.
+
 ## Available Tools
 
 ### Course Management

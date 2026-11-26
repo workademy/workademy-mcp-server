@@ -1,0 +1,35 @@
+{
+  "default": "edera",
+  "workspaces": {
+    "edera": {
+      "id": 10,
+      "name": "EdEra",
+      "hostname": "study.ed-era.com",
+      "apiKeyEnv": "WORKADEMY_API_KEY",
+      "readOnly": false,
+      "report": {
+        "client": "EdEra",
+        "language": "uk"
+      }
+    },
+    "client-a": {
+      "id": 123,
+      "name": "Client A",
+      "hostname": "client-a.theworkademy.com",
+      "readOnly": true,
+      "report": {
+        "language": "de",
+        "minCompletions": 5
+      }
+    },
+    "demo": {
+      "id": 456,
+      "name": "Demo",
+      "hostname": "demo.theworkademy.com",
+      "readOnly": true,
+      "report": {
+        "skip": true
+      }
+    }
+  }
+}

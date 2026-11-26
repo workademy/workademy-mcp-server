@@ -1,2 +1,7 @@
 .idea
 node_modules
+workspaces.json
+.env
+workspaces.keys.json
+reports/
+release/
