@@ -37,6 +37,8 @@ const json = (value: unknown): ToolResult => ({
 export const WRITE_TOOLS = new Set([
   "create_course",
   "update_course",
+  "patch_course",
+  "update_lecture",
   "delete_course",
   "clone_course",
   "update_user",

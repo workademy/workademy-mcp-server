@@ -1,0 +1,62 @@
+{
+  "manifest_version": "0.3",
+  "name": "workademy",
+  "display_name": "Workademy",
+  "version": "0.0.0",
+  "description": "Manage your Workademy workspace from Claude: create and edit courses and lectures, users, groups, enrolments and reports.",
+  "long_description": "Connects Claude to your Workademy workspace through the Workademy API. Claude can list and create courses, edit an existing course lecture by lecture (text, quiz questions, names), change course settings, enrol users, manage groups and learning paths, and pull reports. It runs on your computer and talks only to your own workspace, using the API key you enter.",
+  "author": {
+    "name": "Workademy GmbH",
+    "url": "https://theworkademy.com"
+  },
+  "homepage": "https://theworkademy.com",
+  "icon": "assets/workademy-logo.png",
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "WORKADEMY_API_KEY": "${user_config.api_key}",
+        "WORKADEMY_BASE_URL": "${user_config.workspace_url}",
+        "WORKADEMY_WORKSPACES_FILE": "none",
+        "WORKADEMY_REPORTS_DIR": "${DOCUMENTS}${/}Workademy reports"
+      }
+    }
+  },
+  "tools_generated": true,
+  "keywords": [
+    "workademy",
+    "lms",
+    "courses",
+    "e-learning"
+  ],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "user_config": {
+    "workspace_url": {
+      "type": "string",
+      "title": "Workspace address",
+      "description": "The address you open to reach your Workademy workspace, starting with https:// and without a slash at the end, for example https://yourcompany.theworkademy.com",
+      "required": true
+    },
+    "api_key": {
+      "type": "string",
+      "title": "API key",
+      "description": "Your workspace API key. In Workademy, open Admin Area, then Integrations Management, then the API Key tab, and copy the key. Keep it private.",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}

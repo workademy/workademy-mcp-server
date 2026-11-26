@@ -1,4 +1,4 @@
-import { Method } from "axios";
+import { AxiosError, Method } from "axios";
 import { ApiClient } from "./extended-tools.js";
 interface WorkademyConfig {
     baseUrl: string;
@@ -45,6 +45,12 @@ export declare class WorkademyClient implements ApiClient {
     getCourse(courseId: number, include?: string): Promise<any>;
     createCourse(courseData: any): Promise<any>;
     updateCourse(courseId: number, courseData: any): Promise<any>;
+    patchCourse(courseId: number, courseData: any): Promise<any>;
+    /**
+     * Changes one lecture. The API has no lecture endpoint and PATCH ignores modules, so this reads the
+     * whole course, changes the one lecture and sends the whole course back (PUT needs every module).
+     */
+    updateLecture(courseId: number, lectureId: number, changes: any): Promise<any>;
     deleteCourse(courseId: number): Promise<void>;
     cloneCourse(courseId: number): Promise<any>;
     listUsers(params?: {
@@ -121,5 +127,24 @@ export declare class WorkademyClient implements ApiClient {
     private analyzeCsvLightweight;
     private analyzeCSV;
 }
+/** Module and lecture names with their ids, without the content: what is needed to pick a lecture. */
+export declare function courseOutline(course: any): any;
+/** Finds a lecture in a course fetched with its modules, by its `id` or its `lectureId`. */
+export declare function findLecture(course: any, lectureId: number): {
+    module: any;
+    lecture: any;
+};
+/**
+ * Applies changes to one lecture inside a full course object (in place) and says what changed.
+ * Plain fields (name, description, mediaSource, …) are replaced; `sections` and `questionAnswers`
+ * are lists of partial objects matched to the existing ones by id. Ids cannot be changed.
+ */
+export declare function applyLectureChanges(course: any, lectureId: number, changes: any): any;
+/**
+ * What the API said about a failed call: its message, reason and error code when it names them,
+ * otherwise the start of the response body, so a bare "Request failed with status code 412"
+ * is never all there is to go on.
+ */
+export declare function describeApiError(error: AxiosError): string;
 export {};
 //# sourceMappingURL=index.d.ts.map

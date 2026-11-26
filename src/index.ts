@@ -239,6 +239,30 @@ export class WorkademyClient implements ApiClient {
     return response.data;
   }
 
+  async patchCourse(courseId: number, courseData: any): Promise<any> {
+    await this.ensureAuthenticated();
+    const response = await this.axiosInstance.patch(
+      `/api/v1/secured/courses/${courseId}`,
+      courseData
+    );
+    return response.data;
+  }
+
+  /**
+   * Changes one lecture. The API has no lecture endpoint and PATCH ignores modules, so this reads the
+   * whole course, changes the one lecture and sends the whole course back (PUT needs every module).
+   */
+  async updateLecture(courseId: number, lectureId: number, changes: any): Promise<any> {
+    await this.ensureAuthenticated();
+    const current = await this.axiosInstance.get(`/api/v1/secured/courses/${courseId}`, {
+      params: { include: "modules" },
+    });
+    const course = current.data;
+    const applied = applyLectureChanges(course, lectureId, changes);
+    await this.axiosInstance.put(`/api/v1/secured/courses/${courseId}`, course);
+    return applied;
+  }
+
   async deleteCourse(courseId: number): Promise<void> {
     await this.ensureAuthenticated();
     await this.axiosInstance.delete(`/api/v1/secured/courses/${courseId}`);
@@ -977,6 +1001,71 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "patch_course",
+        description:
+          "Change course-level fields of an existing course (name, description, subtitle, settings…). " +
+          "Send only the fields that change. Modules and lectures cannot be changed this way (the API ignores them): " +
+          "use update_lecture for lecture content. Returns a short confirmation, not the course.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            courseId: {
+              type: "number",
+              description: "The ID of the course to change",
+            },
+            courseData: {
+              type: "object",
+              description: "Only the fields to change (JSON object)",
+            },
+          },
+          required: ["courseId", "courseData"],
+        },
+      },
+      {
+        name: "get_course_outline",
+        description:
+          "The modules and lectures of a course with their ids, names and how many sections and questions each has, " +
+          "without the content. Use it to find a lecture id; get_course with modules returns the whole content and is very large.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            courseId: { type: "number", description: "The ID of the course" },
+          },
+          required: ["courseId"],
+        },
+      },
+      {
+        name: "get_lecture",
+        description:
+          "One lecture of a course with its full content: fields, sections (the lecture text, HTML) and quiz questions, each with its id.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            courseId: { type: "number", description: "The ID of the course" },
+            lectureId: { type: "number", description: "The lecture's id (from get_course_outline)" },
+          },
+          required: ["courseId", "lectureId"],
+        },
+      },
+      {
+        name: "update_lecture",
+        description:
+          "Change one lecture of an existing course; the rest of the course stays as it is. " +
+          "`changes` holds only what changes: plain fields such as name, description or mediaSource, and/or " +
+          "`sections` and `questionAnswers` as lists of objects with the `id` of an existing section or question plus the fields to change " +
+          "(for a section's text: {\"id\": 123, \"text\": \"<p>…</p>\"}). It changes existing sections and questions; it does not add or remove them. " +
+          "Read the lecture with get_lecture first. Returns a short confirmation.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            courseId: { type: "number", description: "The ID of the course" },
+            lectureId: { type: "number", description: "The lecture's id (from get_course_outline)" },
+            changes: { type: "object", description: "Only the fields to change (JSON object)" },
+          },
+          required: ["courseId", "lectureId", "changes"],
+        },
+      },
+      {
         name: "delete_course",
         description: "Delete a course",
         inputSchema: {
@@ -1596,6 +1685,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "patch_course": {
+        const { courseId, courseData } = request.params.arguments as any;
+        if (!courseData || typeof courseData !== "object" || Object.keys(courseData).length === 0) {
+          throw new McpError(ErrorCode.InvalidRequest, `"courseData" must be an object with at least one field to change.`);
+        }
+        if ("modules" in courseData) {
+          throw new McpError(
+            ErrorCode.InvalidRequest,
+            "patch_course cannot change modules or lectures (the API ignores them without an error). Use update_lecture."
+          );
+        }
+        const result = await client.patchCourse(courseId, courseData);
+        const summary: any = { courseId: result?.id ?? courseId, name: result?.name, updateTime: result?.updateTime, fields: {} };
+        for (const key of Object.keys(courseData)) {
+          summary.fields[key] = result?.[key];
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
+        };
+      }
+
+      case "get_course_outline": {
+        const { courseId } = request.params.arguments as any;
+        const course = await client.getCourse(courseId, "modules");
+        return {
+          content: [{ type: "text", text: JSON.stringify(courseOutline(course), null, 2) }],
+        };
+      }
+
+      case "get_lecture": {
+        const { courseId, lectureId } = request.params.arguments as any;
+        const course = await client.getCourse(courseId, "modules");
+        const { module, lecture } = findLecture(course, lectureId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ courseId: course.id, moduleId: module.id, moduleName: module.name, lecture }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "update_lecture": {
+        const { courseId, lectureId, changes } = request.params.arguments as any;
+        const result = await client.updateLecture(courseId, lectureId, changes);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
       case "delete_course": {
         const { courseId } = request.params.arguments as any;
         await client.deleteCourse(courseId);
@@ -2010,8 +2150,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error: any) {
     if (error instanceof AxiosError) {
-      const data: any = error.response?.data;
-      const errorMessage = data?.message || data?.error_description || error.message;
+      const errorMessage = describeApiError(error);
       const errorStatus = error.response?.status;
       const call = `${(error.config?.method ?? "").toUpperCase()} ${error.config?.url ?? ""}`.trim();
       throw new McpError(
@@ -2022,6 +2161,152 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw error;
   }
 });
+
+/** Module and lecture names with their ids, without the content: what is needed to pick a lecture. */
+export function courseOutline(course: any): any {
+  return {
+    id: course?.id,
+    name: course?.name,
+    published: course?.published,
+    modules: (course?.modules ?? []).map((module: any) => ({
+      id: module.id,
+      number: module.number,
+      name: module.name,
+      lectures: (module.lectures ?? []).map((lecture: any) => ({
+        id: lecture.id,
+        number: lecture.number,
+        name: lecture.name,
+        sections: (lecture.sections ?? []).length,
+        questions: (lecture.questionAnswers ?? []).length,
+      })),
+    })),
+  };
+}
+
+/** Finds a lecture in a course fetched with its modules, by its `id` or its `lectureId`. */
+export function findLecture(course: any, lectureId: number): { module: any; lecture: any } {
+  const modules: any[] = Array.isArray(course?.modules) ? course.modules : [];
+  if (modules.length === 0) {
+    throw new McpError(ErrorCode.InvalidRequest, `Course ${course?.id} came back without modules; nothing was changed.`);
+  }
+  for (const module of modules) {
+    for (const lecture of module.lectures ?? []) {
+      if (lecture.id === lectureId || lecture.lectureId === lectureId) {
+        return { module, lecture };
+      }
+    }
+  }
+  throw new McpError(
+    ErrorCode.InvalidRequest,
+    `Lecture ${lectureId} is not in course ${course?.id}. Use get_course_outline to see the lecture ids.`
+  );
+}
+
+const LECTURE_ID_FIELDS = new Set(["id", "lectureId", "moduleId"]);
+
+function mergeById(existing: any[], changes: any, label: string, lectureId: number): number[] {
+  if (!Array.isArray(changes)) {
+    throw new McpError(ErrorCode.InvalidRequest, `"${label}" must be a list of objects, each with the id of an existing entry.`);
+  }
+  const changed: number[] = [];
+  for (const change of changes) {
+    const target = existing.find((entry) => entry.id === change?.id);
+    if (!target) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `"${label}" entry ${change?.id ?? "(no id)"} is not in lecture ${lectureId}. This tool changes existing ${label}; ` +
+          `it does not add new ones. Use get_lecture to see their ids. Nothing was changed.`
+      );
+    }
+    for (const [key, value] of Object.entries(change)) {
+      if (key !== "id") {
+        target[key] = value;
+      }
+    }
+    changed.push(target.id);
+  }
+  return changed;
+}
+
+/**
+ * Applies changes to one lecture inside a full course object (in place) and says what changed.
+ * Plain fields (name, description, mediaSource, …) are replaced; `sections` and `questionAnswers`
+ * are lists of partial objects matched to the existing ones by id. Ids cannot be changed.
+ */
+export function applyLectureChanges(course: any, lectureId: number, changes: any): any {
+  if (!changes || typeof changes !== "object" || Array.isArray(changes) || Object.keys(changes).length === 0) {
+    throw new McpError(ErrorCode.InvalidRequest, `"changes" must be an object with at least one field to change.`);
+  }
+  const { module, lecture } = findLecture(course, lectureId);
+  const changedFields: string[] = [];
+  let changedSections: number[] = [];
+  let changedQuestions: number[] = [];
+  // Check everything before touching the lecture, so a bad entry leaves it as it was.
+  const draft = JSON.parse(JSON.stringify(lecture));
+  for (const [key, value] of Object.entries(changes)) {
+    if (LECTURE_ID_FIELDS.has(key)) {
+      continue;
+    }
+    if (key === "sections") {
+      changedSections = mergeById(draft.sections ?? [], value, "sections", lecture.id);
+    } else if (key === "questionAnswers") {
+      changedQuestions = mergeById(draft.questionAnswers ?? [], value, "questionAnswers", lecture.id);
+    } else {
+      draft[key] = value;
+      changedFields.push(key);
+    }
+  }
+  if (changedFields.length + changedSections.length + changedQuestions.length === 0) {
+    throw new McpError(ErrorCode.InvalidRequest, `"changes" held nothing that can be changed (ids cannot be changed).`);
+  }
+  Object.assign(lecture, draft);
+  return {
+    courseId: course.id,
+    moduleId: module.id,
+    moduleName: module.name,
+    lectureId: lecture.id,
+    lectureName: lecture.name,
+    changedFields,
+    changedSections,
+    changedQuestions,
+  };
+}
+
+/**
+ * What the API said about a failed call: its message, reason and error code when it names them,
+ * otherwise the start of the response body, so a bare "Request failed with status code 412"
+ * is never all there is to go on.
+ */
+export function describeApiError(error: AxiosError): string {
+  const data: any = error.response?.data;
+  if (data === undefined || data === null || data === "") {
+    return `${error.message} (the API sent no response body)`;
+  }
+  if (typeof data === "string") {
+    const text = data.trim();
+    if (/^<(!doctype|html)/i.test(text)) {
+      return `${error.message} (the response was a web page, not JSON)`;
+    }
+    return `${error.message}: ${text.slice(0, 500)}`;
+  }
+  const named = [data.message, data.error_description, data.reason, data.error, data.detail]
+    .filter((part) => typeof part === "string" && part.trim() !== "");
+  const code = data.code ?? data.errorCode;
+  const parts = [...new Set(named)];
+  if (code !== undefined && code !== null) {
+    parts.push(`code ${code}`);
+  }
+  if (parts.length > 0) {
+    return parts.join("; ");
+  }
+  let raw: string;
+  try {
+    raw = JSON.stringify(data);
+  } catch {
+    raw = String(data);
+  }
+  return `${error.message}: ${raw.slice(0, 500)}`;
+}
 
 // Start the server
 async function main() {

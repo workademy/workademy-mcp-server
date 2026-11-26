@@ -1,6 +1,6 @@
 {
   "name": "workademy-mcp-server",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Model Context Protocol server for Workademy LMS platform",
   "type": "module",
   "main": "dist/index.js",
@@ -11,7 +11,8 @@
     "prepare": "npm run build",
     "test:smoke": "node test/smoke.mjs",
     "keys": "node scripts/create-api-keys.mjs",
-    "reports": "tsc && node dist/cli-reports.js"
+    "reports": "tsc && node dist/cli-reports.js",
+    "pack": "tsc && node scripts/pack-mcpb.mjs"
   },
   "keywords": [
     "mcp",

@@ -177,6 +177,45 @@ and `WORKADEMY_OAUTH_CLIENT_SECRET` (or a base64 `WORKADEMY_OAUTH_CLIENT_BASIC`)
 
 Other optional settings: `WORKADEMY_EXPORT_DIR` (where `export_report` saves CSVs, default: the system temp folder), `WORKADEMY_REPORTS_DIR` (where the client PDFs go, default: `reports/` in the project folder) and `WORKADEMY_CHROME_PATH` (the browser that prints them, if Chrome is not in its usual place).
 
+## Editing an existing course
+
+The API saves a course in two ways, and they do different things:
+
+- `PATCH /courses/{id}` changes course-level fields (name, description, subtitle, settings). It ignores `modules` without an error.
+- `PUT /courses/{id}` replaces the course and needs every module in the body; without them it answers
+  `412 Precondition failed: No modules sent when updating the course (code 2106)`. There is no endpoint for a single lecture.
+
+A course with its modules is large (about 150,000 characters for 18 lectures), so the tools keep it away from the model:
+
+| Tool | What it does |
+|---|---|
+| `get_course_outline` | Modules and lectures with ids, names and the number of sections and questions; no content |
+| `get_lecture` | One lecture with its sections (the text, HTML) and quiz questions, each with its id |
+| `update_lecture` | Changes one lecture: plain fields (`name`, `description`, `mediaSource`, …) and/or `sections` and `questionAnswers` as lists of `{id, …fields to change}`. The server reads the whole course, changes that lecture and PUTs the whole course back |
+| `patch_course` | Course-level fields only; refuses a body with `modules`; returns a short confirmation |
+| `update_course` | The raw PUT: needs the complete course with its modules |
+
+`update_lecture` changes existing sections and questions; it does not add or remove lectures, sections or questions.
+It is a read-modify-write of the whole course, so a save in the web editor during those seconds can be overwritten.
+Tested on an unpublished course (name, section text, question wording: only those changed, all ids kept); not yet on a
+course with learners in progress.
+
+When a call fails, the error now carries what the API said (`message`, `reason`, `error`, `code`), or the start of the
+response body when it names none.
+
+## Client package (.mcpb)
+
+`npm run pack` builds `release/workademy-<version>.mcpb`: one file a customer installs in the Claude desktop app with a
+double-click (Claude Desktop only; it brings its own Node). The customer enters their workspace address and their API
+key (Admin Area → Integrations Management → API Key), and the server runs in the single-workspace setup.
+
+- The package holds `dist/` (without `cli-reports.js`), `assets/`, the runtime dependencies and `mcpb/manifest.json`
+  (its version comes from `package.json`). `workspaces.json`, `workspaces.keys.json`, `.env` and `reports/` never go in,
+  and the script stops if it finds one of them.
+- The customer gets every tool, with write access to their own workspace.
+- The built-in OAuth client (see "Multiple workspaces") is part of the code and therefore of the package.
+- `release/` is git-ignored. Send the file by link, not as an e-mail attachment: mail filters tend to block archives with code.
+
 ## Analytics and reporting tools
 
 | Tool | What it returns |
